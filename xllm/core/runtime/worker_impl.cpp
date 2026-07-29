@@ -180,6 +180,15 @@ void ensure_forward_input_device_tensors(ForwardInput& input,
 
 #if defined(USE_NPU)
 void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
+  // Early-return on dummy/empty-shard inputs. Under dp>1, an empty shard is
+  // padded with a fake token by worker_impl but its GDN-related tensors
+  // (attention.device.kv_cache_tokens_nums etc.) are left undefined. Reading
+  // them below would raise a c10::Error at gt_Scalar. The condition mirrors
+  // AttentionMetadataBuilder::is_dummy (attention_metadata_builder.cpp:223).
+  if (input_params.meta.q_max_seq_len == 0 ||
+      input_params.meta.num_sequences == 0) {
+    return;
+  }
   const std::vector<int32_t>& host_q_seq_lens =
       input_params.attention.host.q_seq_lens;
   const bool has_leading_zero =

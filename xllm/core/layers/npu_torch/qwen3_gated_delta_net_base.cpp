@@ -535,6 +535,15 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
     const ModelInputParams& input_params) {
+  // Early-return on dummy shards. Under dp>1, an empty shard is padded with a
+  // fake token by worker_impl but its GDN state tensors (kv_cache_tokens_nums,
+  // linear_state_ids etc.) are left undefined. This mirrors the is_dummy
+  // early-return in npu_torch Attention::forward (attention.cpp:48). Uses
+  // zeros_like rather than empty_like so downstream post-norm / mlp do not
+  // read uninitialized data.
+  if (attn_metadata.is_dummy) {
+    return torch::zeros_like(hidden_states);
+  }
   // Save original hidden_states size for potential padding later
   const int64_t original_num_tokens = hidden_states.size(0);
   const bool use_spec_verify = input_params.is_spec_verify;
