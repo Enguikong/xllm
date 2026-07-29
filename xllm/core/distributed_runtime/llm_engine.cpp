@@ -1199,6 +1199,28 @@ std::vector<ForwardInput> LLMEngine::prepare_inputs(std::vector<Batch>& batch) {
         batched_inputs[dp_rank].input_params.meta.q_max_seq_len == 1;
   }
 
+  {
+    // XLLM-DP-DIAG: per-step per-dp_rank workload snapshot.
+    // Fields: dp_rank, tokens (dp_global_token_nums[dp_rank]), num_seq
+    //   (batched_inputs[dp_rank].input_params.meta.num_sequences),
+    //   batch_type (0=prefill / 1=chunked_prefill / 2=decode / 3=mixed /
+    //   4=empty), empty (batch_forward_type.is_empty()).
+    // Strict DP effective-parallelism check: for every DECODE step, all
+    // dp_ranks should have tokens>0 num_seq>0 empty=0.
+    std::string dp_snap;
+    for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      const auto& bft =
+          batched_inputs[dp_rank].input_params.meta.batch_forward_type;
+      dp_snap += "dp_rank=" + std::to_string(dp_rank) +
+                 " tokens=" + std::to_string(dp_global_token_nums[dp_rank]) +
+                 " num_seq=" +
+                 std::to_string(
+                     batched_inputs[dp_rank].input_params.meta.num_sequences) +
+                 " batch_type=" + std::to_string(bft.value()) +
+                 " empty=" + std::to_string(bft.is_empty()) + "; ";
+    }
+    LOG(INFO) << "[XLLM-DP-DIAG] " << dp_snap;
+  }
   // eplb related
   EplbInfo eplb_info;
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
