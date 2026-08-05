@@ -15,40 +15,15 @@ limitations under the License.
 
 #include "attention.h"
 
-#include <algorithm>
 #include <limits>
-#include <sstream>
 #include <vector>
 
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/npu/npu_ops_api.h"
 #include "kernels/ops_api.h"
+#include "layers/npu_torch/dcp_attention_utils.h"
 
 namespace {
-
-std::vector<int64_t> compute_dcp_local_kv_seq_lens(
-    const std::vector<int64_t>& global_kv_seq_lens,
-    int32_t dcp_size,
-    int32_t dcp_rank,
-    int64_t block_size) {
-  CHECK_GT(dcp_size, 1);
-  CHECK_GE(dcp_rank, 0);
-  CHECK_LT(dcp_rank, dcp_size);
-  CHECK_GT(block_size, 0);
-
-  std::vector<int64_t> local_kv_seq_lens;
-  local_kv_seq_lens.reserve(global_kv_seq_lens.size());
-  for (const int64_t global_kv_seq_len : global_kv_seq_lens) {
-    CHECK_GE(global_kv_seq_len, 0);
-    const int64_t base = global_kv_seq_len / block_size / dcp_size * block_size;
-    const int64_t remainder = global_kv_seq_len - base * dcp_size;
-    const int64_t rank_offset = static_cast<int64_t>(dcp_rank) * block_size;
-    const int64_t local_remainder =
-        std::clamp(remainder - rank_offset, int64_t{0}, block_size);
-    local_kv_seq_lens.emplace_back(base + local_remainder);
-  }
-  return local_kv_seq_lens;
-}
 
 void validate_dcp_decode_lengths(const std::vector<int64_t>& q_cu_seq_lens,
                                  const std::vector<int64_t>& global_kv_seq_lens,
@@ -92,35 +67,6 @@ void normalize_zero_dcp_partials(
           .fill_(-std::numeric_limits<float>::infinity());
     }
   }
-}
-
-torch::Tensor merge_dcp_partials(const torch::Tensor& all_partial_out,
-                                 const torch::Tensor& all_partial_lse) {
-  CHECK_EQ(all_partial_out.scalar_type(), torch::kFloat32);
-  CHECK_EQ(all_partial_lse.scalar_type(), torch::kFloat32);
-  CHECK_EQ(all_partial_out.dim(), 4);
-  CHECK_EQ(all_partial_lse.dim(), 4);
-  CHECK_EQ(all_partial_out.size(0), all_partial_lse.size(0));
-  CHECK_EQ(all_partial_out.size(1), all_partial_lse.size(1));
-  CHECK_EQ(all_partial_out.size(2), all_partial_lse.size(2));
-  CHECK_EQ(all_partial_lse.size(3), 1);
-
-  const torch::Tensor max_lse = std::get<0>(all_partial_lse.max(0));
-  const torch::Tensor max_lse_is_finite = torch::isfinite(max_lse);
-  const torch::Tensor safe_max_lse =
-      torch::where(max_lse_is_finite, max_lse, torch::zeros_like(max_lse));
-  const torch::Tensor weights =
-      torch::where(torch::isfinite(all_partial_lse),
-                   torch::exp(all_partial_lse - safe_max_lse),
-                   torch::zeros_like(all_partial_lse));
-  const torch::Tensor denominator = weights.sum(0);
-  const torch::Tensor safe_denominator = torch::where(
-      denominator.gt(0), denominator, torch::ones_like(denominator));
-  const torch::Tensor merged_out =
-      (weights * all_partial_out).sum(0) / safe_denominator;
-  return torch::where(max_lse_is_finite.expand_as(merged_out),
-                      merged_out,
-                      torch::zeros_like(merged_out));
 }
 
 }  // namespace
@@ -282,8 +228,9 @@ void AttentionImpl::dcp_decoder_forward(
   validate_dcp_decode_lengths(q_cu_seq_lens, global_kv_seq_lens, token_count);
 
   const int64_t block_size = k_cache.size(1);
-  const std::vector<int64_t> local_kv_seq_lens = compute_dcp_local_kv_seq_lens(
-      global_kv_seq_lens, dcp_size_, dcp_rank_, block_size);
+  const std::vector<int64_t> local_kv_seq_lens =
+      detail::compute_dcp_local_kv_seq_lens(
+          global_kv_seq_lens, dcp_size_, dcp_rank_, block_size);
   const torch::Tensor local_block_table =
       parallel_state::select_dcp_local_block_table(
           attn_metadata.block_table, dcp_size_, dcp_rank_);
@@ -329,7 +276,7 @@ void AttentionImpl::dcp_decoder_forward(
   const torch::Tensor all_partial_lse =
       dcp_group_->allgather_base_sync(partial_lse);
   const torch::Tensor merged_out =
-      merge_dcp_partials(all_partial_out, all_partial_lse);
+      detail::merge_dcp_partials(all_partial_out, all_partial_lse);
   const int64_t head_begin = static_cast<int64_t>(dcp_rank_) * num_heads_;
   const torch::Tensor local_out =
       merged_out.slice(1, head_begin, head_begin + num_heads_);

@@ -1,6 +1,23 @@
 include(cc_test)
 
 cc_test(
+  NO_NPU_RUNTIME
+  NAME
+    npu_dcp_attention_utils_test
+  SRCS
+    dcp_attention_utils_test.cpp
+    "${PROJECT_SOURCE_DIR}/xllm/core/layers/npu_torch/dcp_attention_utils.cpp"
+  DEPS
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+  target_link_options(npu_dcp_attention_utils_test PRIVATE
+    "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
+endif()
+
+cc_test(
   NAME
     npu_deepseek_v4_indexer_test
   SRCS
