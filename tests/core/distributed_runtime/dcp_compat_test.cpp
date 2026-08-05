@@ -65,13 +65,12 @@ TEST(DcpCompatTest, RejectsDefaultChunkedPrefillFirst) {
       "enable_chunked_prefill=false");
 }
 
-TEST(DcpCompatTest, RejectsPrefixCache) {
+TEST(DcpCompatTest, AllowsPrefixCache) {
   Options options = dcp_options_with_supported_feature_flags();
   options.enable_prefix_cache(true);
 
-  expect_error_contains(
-      validate_dcp_first_version_options(options, EngineType::LLM),
-      "enable_prefix_cache=false");
+  EXPECT_FALSE(
+      validate_dcp_first_version_options(options, EngineType::LLM).has_value());
 }
 
 TEST(DcpCompatTest, RejectsScheduleOverlap) {
