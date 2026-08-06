@@ -15,10 +15,18 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <memory>
 #include <set>
 #include <vector>
 
+#include "core/framework/multimodal/mm_data.h"
+#include "core/framework/sampling/sampling_params.h"
+#include "framework/block/block_manager_pool.h"
 #include "framework/parallel_state/parallel_state.h"
+#include "framework/request/incremental_decoder.h"
+#include "framework/request/sequence.h"
+#include "framework/request/stopping_checker.h"
+#include "layers/npu_torch/dcp_attention_utils.h"
 
 namespace xllm {
 namespace parallel_state {
@@ -43,6 +51,45 @@ int32_t expected_dcp_rank(int32_t global_rank,
   const int32_t tp_size = world_size / dp_size;
   return (global_rank % tp_size) % dcp_size;
 }
+
+class PrefixTestSequence final {
+ public:
+  PrefixTestSequence(size_t index, const std::vector<int32_t>& prompt_tokens) {
+    sampling_param_.beam_width = 0;
+    sampling_param_.is_embeddings = false;
+
+    SequenceParams params;
+    params.seq_capacity = prompt_tokens.size() + 8;
+    params.echo = false;
+    params.skip_special_tokens = true;
+    params.streaming = false;
+    params.enable_schedule_overlap = false;
+    params.rec_type = RecType::kNone;
+    params.bos_token_id = 0;
+    params.request_id = "dcp_prefix_contract_test";
+    params.sampling_param = &sampling_param_;
+    params.stopping_checker = &stopping_checker_;
+
+    IncrementalDecoder decoder(
+        /*prompt=*/"prompt",
+        /*num_prompt_tokens=*/prompt_tokens.size(),
+        /*echo=*/params.echo,
+        /*skip_special_tokens=*/params.skip_special_tokens);
+    sequence_ = std::make_unique<Sequence>(index,
+                                           prompt_tokens,
+                                           /*input_embedding=*/torch::Tensor(),
+                                           /*mm_data=*/MMData(),
+                                           decoder,
+                                           params);
+  }
+
+  Sequence* get() { return sequence_.get(); }
+
+ private:
+  RequestSamplingParam sampling_param_;
+  StoppingChecker stopping_checker_;
+  std::unique_ptr<Sequence> sequence_;
+};
 
 TEST(ComputeCpGroupRanks, CpSizeTwoTpFourDpOne) {
   const int32_t world_size = 8;
@@ -326,6 +373,149 @@ TEST(DcpCacheLayout, PrefillWritesMatchDecodeLocalBlockTable) {
 
       EXPECT_EQ(owner_slot, original_slot);
       EXPECT_EQ(owner_slot / block_size, decode_block_id);
+    }
+  }
+}
+
+TEST(DcpPrefixCacheContract,
+     SharedBlocksSuffixWritesAndLocalLengthsStayOwnerAligned) {
+  const int32_t block_size = 4;
+  const int32_t dcp_size = 2;
+  BlockManagerPool::Options options;
+  options.num_blocks(16)
+      .host_num_blocks(0)
+      .block_size(block_size)
+      .enable_prefix_cache(true);
+  BlockManagerPool pool(options, /*dp_size=*/1);
+
+  PrefixTestSequence seed(
+      /*index=*/0,
+      /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+  ASSERT_TRUE(pool.allocate(seed.get()));
+  seed.get()->kv_state().set_kv_cache_tokens_num(seed.get()->num_tokens());
+  const Slice<Block> seed_blocks = seed.get()->kv_state().blocks(BlockType::KV);
+  ASSERT_EQ(seed_blocks.size(), 3);
+  std::vector<int64_t> seed_block_ids;
+  seed_block_ids.reserve(seed_blocks.size());
+  for (const Block& block : seed_blocks) {
+    seed_block_ids.emplace_back(block.id());
+  }
+  pool.cache(seed.get());
+  pool.deallocate(seed.get());
+
+  PrefixTestSequence probe(
+      /*index=*/1,
+      /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14});
+  ASSERT_TRUE(pool.allocate(probe.get(), probe.get()->num_tokens()));
+  EXPECT_EQ(probe.get()->kv_state().shared_blocks_num(BlockType::KV), 3);
+  EXPECT_EQ(probe.get()->kv_state().kv_cache_tokens_num(), 12);
+
+  const Slice<Block> probe_blocks =
+      probe.get()->kv_state().blocks(BlockType::KV);
+  ASSERT_EQ(probe_blocks.size(), 4);
+  for (int64_t block_index = 0;
+       block_index < static_cast<int64_t>(seed_block_ids.size());
+       ++block_index) {
+    EXPECT_EQ(probe_blocks[block_index].id(), seed_block_ids[block_index]);
+  }
+
+  std::vector<int64_t> global_block_ids;
+  global_block_ids.reserve(probe_blocks.size());
+  for (const Block& block : probe_blocks) {
+    global_block_ids.emplace_back(block.id());
+  }
+  const torch::Tensor global_block_table =
+      torch::tensor(global_block_ids,
+                    torch::TensorOptions().dtype(torch::kInt64))
+          .view({1, static_cast<int64_t>(global_block_ids.size())});
+
+  const int32_t suffix_start =
+      static_cast<int32_t>(probe.get()->kv_state().kv_cache_tokens_num());
+  const int32_t suffix_end = static_cast<int32_t>(probe.get()->num_tokens());
+  const std::vector<int32_t> suffix_slots = probe.get()->kv_state().cache_slots(
+      BlockType::KV, suffix_start, suffix_end);
+  const torch::Tensor suffix_positions = torch::arange(
+      suffix_start, suffix_end, torch::TensorOptions().dtype(torch::kInt64));
+  const torch::Tensor suffix_slot_tensor =
+      torch::tensor(suffix_slots, torch::TensorOptions().dtype(torch::kInt64));
+
+  const std::vector<int32_t> full_slots = probe.get()->kv_state().cache_slots(
+      BlockType::KV, /*pos_start=*/0, suffix_end);
+  const torch::Tensor full_positions =
+      torch::arange(suffix_end, torch::TensorOptions().dtype(torch::kInt64));
+  const torch::Tensor full_slot_tensor =
+      torch::tensor(full_slots, torch::TensorOptions().dtype(torch::kInt64));
+  const std::vector<int64_t> expected_local_kv_seq_lens = {8, 6};
+
+  for (int32_t dcp_rank = 0; dcp_rank < dcp_size; ++dcp_rank) {
+    const torch::Tensor local_block_table =
+        select_dcp_local_block_table(global_block_table, dcp_size, dcp_rank);
+    int64_t local_block_index = 0;
+    for (int64_t global_block_index = dcp_rank;
+         global_block_index < static_cast<int64_t>(global_block_ids.size());
+         global_block_index += dcp_size) {
+      ASSERT_LT(local_block_index, local_block_table.size(1));
+      EXPECT_EQ(local_block_table[0][local_block_index].item<int64_t>(),
+                global_block_ids[global_block_index]);
+      ++local_block_index;
+    }
+    EXPECT_EQ(local_block_index, local_block_table.size(1));
+
+    const torch::Tensor remapped_suffix =
+        remap_dcp_cache_slots(suffix_positions,
+                              suffix_slot_tensor,
+                              /*interleave_size=*/block_size,
+                              dcp_size,
+                              dcp_rank);
+    for (int64_t suffix_index = 0; suffix_index < remapped_suffix.numel();
+         ++suffix_index) {
+      const int64_t remapped_slot =
+          remapped_suffix[suffix_index].item<int64_t>();
+      if (remapped_slot < 0) {
+        continue;
+      }
+      const int64_t position = suffix_positions[suffix_index].item<int64_t>();
+      const int64_t global_block_index = position / block_size;
+      const int64_t local_block_index = global_block_index / dcp_size;
+      ASSERT_LT(local_block_index, local_block_table.size(1));
+      EXPECT_EQ(remapped_slot / block_size,
+                local_block_table[0][local_block_index].item<int64_t>());
+    }
+
+    const torch::Tensor remapped_full =
+        remap_dcp_cache_slots(full_positions,
+                              full_slot_tensor,
+                              /*interleave_size=*/block_size,
+                              dcp_size,
+                              dcp_rank);
+    const std::vector<int64_t> local_kv_seq_lens =
+        layer::detail::compute_dcp_local_kv_seq_lens(
+            /*global_kv_seq_lens=*/{suffix_end},
+            dcp_size,
+            dcp_rank,
+            block_size);
+    ASSERT_EQ(local_kv_seq_lens.size(), 1);
+    EXPECT_EQ(local_kv_seq_lens.front(), expected_local_kv_seq_lens[dcp_rank]);
+    EXPECT_EQ(local_kv_seq_lens.front(),
+              remapped_full.ge(0).sum().item<int64_t>());
+
+    if (dcp_rank == 0) {
+      EXPECT_EQ(remapped_full.slice(/*dim=*/0, /*start=*/4, /*end=*/8)
+                    .ge(0)
+                    .sum()
+                    .item<int64_t>(),
+                0);
+    } else {
+      EXPECT_EQ(remapped_full.slice(/*dim=*/0, /*start=*/0, /*end=*/4)
+                    .ge(0)
+                    .sum()
+                    .item<int64_t>(),
+                0);
+      EXPECT_EQ(remapped_full.slice(/*dim=*/0, /*start=*/8, /*end=*/12)
+                    .ge(0)
+                    .sum()
+                    .item<int64_t>(),
+                0);
     }
   }
 }

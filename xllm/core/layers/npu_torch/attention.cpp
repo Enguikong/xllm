@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "attention.h"
 
+#include <algorithm>
 #include <limits>
 #include <vector>
 
@@ -67,6 +68,22 @@ void normalize_zero_dcp_partials(
           .fill_(-std::numeric_limits<float>::infinity());
     }
   }
+}
+
+void validate_dcp_partial_shape(const torch::Tensor& partial_out,
+                                const torch::Tensor& partial_lse,
+                                int64_t token_count,
+                                int64_t num_heads,
+                                int64_t head_size,
+                                const char* partial_name) {
+  CHECK_EQ(partial_out.dim(), 3) << partial_name;
+  CHECK_EQ(partial_out.size(0), token_count) << partial_name;
+  CHECK_EQ(partial_out.size(1), num_heads) << partial_name;
+  CHECK_EQ(partial_out.size(2), head_size) << partial_name;
+  CHECK_EQ(partial_lse.dim(), 3) << partial_name;
+  CHECK_EQ(partial_lse.size(0), token_count) << partial_name;
+  CHECK_EQ(partial_lse.size(1), num_heads) << partial_name;
+  CHECK_EQ(partial_lse.size(2), 1) << partial_name;
 }
 
 }  // namespace
@@ -129,6 +146,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> AttentionImpl::forward(
 
   if (attn_metadata.use_expanded_decode_for_spec_verify_attention) {
     decoder_forward(query, output, k_cache, v_cache, attn_metadata);
+  } else if (dcp_size_ > 1 && attn_metadata.is_chunked_prefill) {
+    // Mixed batches also set is_chunked_prefill, but the DCP cache-slot gate in
+    // WorkerImpl rejects them upstream, so only pure chunked prefill reaches
+    // here under DCP.
+    dcp_chunked_prefill_forward(
+        query, key, value, output, k_cache, v_cache, attn_metadata);
   } else if (only_prefill) {
     prefill_forward(query, key, value, output, k_cache, v_cache, attn_metadata);
   } else {
@@ -280,6 +303,170 @@ void AttentionImpl::dcp_decoder_forward(
   const int64_t head_begin = static_cast<int64_t>(dcp_rank_) * num_heads_;
   const torch::Tensor local_out =
       merged_out.slice(1, head_begin, head_begin + num_heads_);
+  output.copy_(local_out.to(output.scalar_type()));
+}
+
+void AttentionImpl::dcp_chunked_prefill_forward(
+    torch::Tensor& query,
+    torch::Tensor& key,
+    torch::Tensor& value,
+    torch::Tensor& output,
+    const torch::Tensor& k_cache,
+    const std::optional<torch::Tensor>& v_cache,
+    const AttentionMetadata& attn_metadata) {
+  CHECK(dcp_group_ != nullptr) << "DCP chunked prefill requires a DCP group.";
+  CHECK_EQ(dcp_group_->world_size(), dcp_size_)
+      << "DCP process group size does not match attention DCP size.";
+  CHECK_EQ(dcp_group_->rank(), dcp_rank_)
+      << "DCP process group rank does not match attention DCP rank.";
+  CHECK(!attn_metadata.is_spec_verify)
+      << "DCP chunked prefill does not support speculative decode attention.";
+  CHECK(!attn_metadata.paged_attention_tiling_data.defined())
+      << "DCP chunked prefill does not support graph-captured attention.";
+  CHECK(v_cache.has_value() && v_cache.value().defined())
+      << "DCP chunked prefill requires a defined V cache.";
+  CHECK(attn_metadata.block_table.defined())
+      << "DCP chunked prefill requires a paged KV block table.";
+  CHECK(attn_metadata.fia_attn_mask.defined())
+      << "DCP chunked prefill requires a causal attention mask.";
+
+  query = query.view({-1, num_heads_, head_size_});
+  output = output.view({-1, num_heads_, head_size_});
+  key = key.view({-1, num_kv_heads_, head_size_});
+  value = value.view({-1, num_kv_heads_, head_size_});
+
+  const int64_t token_count = query.size(0);
+  const std::vector<int64_t>& global_kv_seq_lens =
+      attn_metadata.kv_seq_lens_host_vec;
+  const std::vector<int64_t> q_cu_seq_lens =
+      detail::validate_dcp_chunked_lengths(attn_metadata.q_cu_seq_lens_host_vec,
+                                           global_kv_seq_lens,
+                                           token_count);
+
+  const int64_t block_size = k_cache.size(1);
+  const int64_t group_num_heads = num_heads_ * static_cast<int64_t>(dcp_size_);
+  CHECK_EQ(group_num_heads % num_kv_heads_, 0)
+      << "DCP gathered Q heads must preserve the GQA ratio.";
+  CHECK_EQ(key.size(0), token_count);
+  CHECK_EQ(value.size(0), token_count);
+
+  // Gather the query heads across the DCP group so every partial covers the
+  // full head-group; each rank slices back its own head range after merge.
+  const torch::Tensor query_group =
+      parallel_state::gather(query, dcp_group_, 1);
+  CHECK_EQ(query_group.dim(), 3);
+  CHECK_EQ(query_group.size(0), token_count);
+  CHECK_EQ(query_group.size(1), group_num_heads);
+  CHECK_EQ(query_group.size(2), head_size_);
+
+  // Current/diagonal part: the current chunk attends to its own KV with a
+  // causal mask. The raw key/value projections are identical on every DCP rank
+  // (KV heads are replicated within the group), so this part is not sharded.
+  const auto current_result = xllm::kernel::npu::npu_fused_infer_attention(
+      query_group,
+      key,
+      value,
+      std::make_optional(attn_metadata.fia_attn_mask),
+      /*block_table=*/std::nullopt,
+      q_cu_seq_lens,
+      /*actual_seq_lengths_kv=*/q_cu_seq_lens,
+      group_num_heads,
+      num_kv_heads_,
+      scale_,
+      /*block_size=*/0,
+      /*sparse_mode=*/3,
+      "TND",
+      /*softmax_lse_flag=*/true);
+  torch::Tensor current_out = std::get<0>(current_result).to(torch::kFloat32);
+  torch::Tensor current_lse = std::get<1>(current_result).to(torch::kFloat32);
+  validate_dcp_partial_shape(current_out,
+                             current_lse,
+                             token_count,
+                             group_num_heads,
+                             head_size_,
+                             "DCP chunked current partial shape mismatch.");
+
+  // Context part: the current chunk attends to the previously-cached context
+  // KV, which is DCP-sharded round-robin over blocks. Each rank computes a
+  // partial over only its local context shard (no mask, full history visible).
+  const std::vector<int64_t> context_lens =
+      detail::compute_dcp_context_lens(q_cu_seq_lens, global_kv_seq_lens);
+  const int64_t head_begin = static_cast<int64_t>(dcp_rank_) * num_heads_;
+  if (std::all_of(context_lens.begin(),
+                  context_lens.end(),
+                  [](int64_t context_len) { return context_len == 0; })) {
+    const torch::Tensor local_out =
+        current_out.slice(1, head_begin, head_begin + num_heads_);
+    CHECK_EQ(local_out.size(0), token_count);
+    CHECK_EQ(local_out.size(1), num_heads_);
+    CHECK_EQ(local_out.size(2), head_size_);
+    output.copy_(local_out.to(output.scalar_type()));
+    return;
+  }
+
+  const std::vector<int64_t> local_context_lens =
+      detail::compute_dcp_local_kv_seq_lens(
+          context_lens, dcp_size_, dcp_rank_, block_size);
+  const torch::Tensor local_block_table =
+      parallel_state::select_dcp_local_block_table(
+          attn_metadata.block_table, dcp_size_, dcp_rank_);
+  detail::validate_dcp_chunked_block_table(
+      local_block_table, static_cast<int64_t>(q_cu_seq_lens.size()));
+
+  const torch::Tensor k = k_cache.view({k_cache.size(0), k_cache.size(1), -1});
+  const torch::Tensor v = v_cache.value().view(
+      {v_cache.value().size(0), v_cache.value().size(1), -1});
+  const auto context_result = xllm::kernel::npu::npu_fused_infer_attention(
+      query_group,
+      k,
+      v,
+      /*atten_mask=*/std::nullopt,
+      std::make_optional(local_block_table),
+      q_cu_seq_lens,
+      local_context_lens,
+      group_num_heads,
+      num_kv_heads_,
+      scale_,
+      block_size,
+      /*sparse_mode=*/0,
+      "TND",
+      /*softmax_lse_flag=*/true);
+  torch::Tensor context_out = std::get<0>(context_result).to(torch::kFloat32);
+  torch::Tensor context_lse = std::get<1>(context_result).to(torch::kFloat32);
+  validate_dcp_partial_shape(context_out,
+                             context_lse,
+                             token_count,
+                             group_num_heads,
+                             head_size_,
+                             "DCP chunked context partial shape mismatch.");
+  detail::normalize_zero_dcp_chunked_partials(
+      context_out, context_lse, local_context_lens, q_cu_seq_lens);
+
+  // Merge context shards from all ranks with the (replicated) current part in a
+  // single online-softmax reduction: softmax over a key set partitioned into
+  // dcp_size context shards plus the current chunk is associative, so stacking
+  // all partials and merging once is exact. The current part is identical on
+  // every rank, so contributing it once (from this rank) is correct.
+  const torch::Tensor all_context_out =
+      dcp_group_->allgather_base_sync(context_out);
+  const torch::Tensor all_context_lse =
+      dcp_group_->allgather_base_sync(context_lse);
+  const torch::Tensor stacked_out =
+      torch::cat({all_context_out, current_out.unsqueeze(0)}, 0);
+  const torch::Tensor stacked_lse =
+      torch::cat({all_context_lse, current_lse.unsqueeze(0)}, 0);
+  const torch::Tensor merged_out =
+      detail::merge_dcp_partials(stacked_out, stacked_lse);
+
+  CHECK_EQ(merged_out.dim(), 3);
+  CHECK_EQ(merged_out.size(0), token_count);
+  CHECK_EQ(merged_out.size(1), group_num_heads);
+  CHECK_EQ(merged_out.size(2), head_size_);
+  const torch::Tensor local_out =
+      merged_out.slice(1, head_begin, head_begin + num_heads_);
+  CHECK_EQ(local_out.size(0), token_count);
+  CHECK_EQ(local_out.size(1), num_heads_);
+  CHECK_EQ(local_out.size(2), head_size_);
   output.copy_(local_out.to(output.scalar_type()));
 }
 

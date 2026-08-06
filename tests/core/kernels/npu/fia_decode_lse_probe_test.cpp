@@ -28,7 +28,9 @@ limitations under the License.
 #include <torch_npu/torch_npu.h>
 
 #include <cmath>
+#include <limits>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "core/kernels/npu/npu_ops_api.h"
@@ -65,10 +67,67 @@ void write_paged_kv_cache(torch::Tensor& key,
 
 float max_abs_diff(const torch::Tensor& expected, const torch::Tensor& actual) {
   const torch::Tensor expected_cpu =
-      expected.cpu().to(torch::kFloat32).view({-1});
-  const torch::Tensor actual_cpu = actual.cpu().to(torch::kFloat32).view({-1});
+      expected.cpu().to(torch::kFloat32).reshape({-1});
+  const torch::Tensor actual_cpu =
+      actual.cpu().to(torch::kFloat32).reshape({-1});
   CHECK_EQ(expected_cpu.numel(), actual_cpu.numel());
   return (expected_cpu - actual_cpu).abs().max().item<float>();
+}
+
+std::pair<torch::Tensor, torch::Tensor> reference_attention(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    double scale,
+    bool causal) {
+  CHECK_EQ(query.dim(), 3);
+  CHECK_EQ(key.dim(), 3);
+  CHECK_EQ(value.sizes(), key.sizes());
+  CHECK_EQ(query.size(2), key.size(2));
+  CHECK_EQ(query.size(1) % key.size(1), 0);
+
+  const torch::Tensor query_cpu = query.cpu().to(torch::kFloat32);
+  const torch::Tensor key_cpu = key.cpu().to(torch::kFloat32);
+  const torch::Tensor value_cpu = value.cpu().to(torch::kFloat32);
+  const int64_t expansion_factor = query_cpu.size(1) / key_cpu.size(1);
+  const torch::Tensor expanded_key =
+      key_cpu.unsqueeze(2)
+          .expand({key_cpu.size(0),
+                   key_cpu.size(1),
+                   expansion_factor,
+                   key_cpu.size(2)})
+          .reshape({key_cpu.size(0), query_cpu.size(1), key_cpu.size(2)});
+  const torch::Tensor expanded_value =
+      value_cpu.unsqueeze(2)
+          .expand({value_cpu.size(0),
+                   value_cpu.size(1),
+                   expansion_factor,
+                   value_cpu.size(2)})
+          .reshape({value_cpu.size(0), query_cpu.size(1), value_cpu.size(2)});
+
+  torch::Tensor scores =
+      torch::einsum("qhd,khd->qhk", {query_cpu, expanded_key}) * scale;
+  if (causal) {
+    CHECK_EQ(query_cpu.size(0), key_cpu.size(0));
+    const torch::Tensor causal_mask =
+        torch::triu(torch::ones({query_cpu.size(0), key_cpu.size(0)},
+                                torch::TensorOptions().dtype(torch::kBool)),
+                    1);
+    scores = scores.masked_fill(causal_mask.unsqueeze(1),
+                                -std::numeric_limits<float>::infinity());
+  }
+  const torch::Tensor lse = torch::logsumexp(scores, -1, true);
+  const torch::Tensor output = torch::einsum(
+      "qhk,khd->qhd", {torch::softmax(scores, -1), expanded_value});
+  return {output, lse};
+}
+
+torch::Tensor make_fia_causal_mask(const torch::Device& device) {
+  const torch::TensorOptions options =
+      torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  return torch::triu(torch::ones({2048, 2048}, options), 1)
+      .to(torch::kInt8)
+      .contiguous();
 }
 
 // One decode step: batch=1, q_len=1, ctx_len tokens already in paged KV cache.
@@ -186,6 +245,200 @@ TEST_F(FiaDecodeLseProbe, DecodeFiaOutputMatchesBatchDecodeAndLseIsFinite) {
   // LSE = log(sum exp(scores)) over ctx_len keys; must be finite real number.
   EXPECT_GT(lse_max, -1e30f) << "LSE unreasonably small";
   EXPECT_LT(lse_max, 1e30f) << "LSE unreasonably large";
+}
+
+TEST_F(FiaDecodeLseProbe, MultiTokenRawKvCausalOutputAndLseMatchReference) {
+  const int64_t num_heads = 8;
+  const int64_t num_kv_heads = 2;
+  const int64_t head_dim = 128;
+  const int64_t token_count = 7;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+  const torch::TensorOptions options =
+      torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
+
+  const torch::Tensor query =
+      torch::randn({token_count, num_heads, head_dim}, options) * 0.1;
+  const torch::Tensor key =
+      torch::randn({token_count, num_kv_heads, head_dim}, options) * 0.1;
+  const torch::Tensor value =
+      torch::randn({token_count, num_kv_heads, head_dim}, options) * 0.1;
+  const torch::Tensor causal_mask = make_fia_causal_mask(device_);
+  const std::vector<int64_t> cumulative_query_lengths = {3, 7};
+
+  const auto [output, lse] =
+      npu_fused_infer_attention(query,
+                                key,
+                                value,
+                                std::make_optional(causal_mask),
+                                /*block_table=*/std::nullopt,
+                                cumulative_query_lengths,
+                                cumulative_query_lengths,
+                                num_heads,
+                                num_kv_heads,
+                                scale,
+                                /*block_size=*/0,
+                                /*sparse_mode=*/3,
+                                "TND",
+                                /*softmax_lse_flag=*/true);
+  ASSERT_EQ(aclrtSynchronizeStream(c10_npu::getCurrentNPUStream().stream()),
+            ACL_SUCCESS);
+
+  ASSERT_EQ(output.sizes(),
+            torch::IntArrayRef({token_count, num_heads, head_dim}));
+  ASSERT_EQ(lse.sizes(), torch::IntArrayRef({token_count, num_heads, 1}));
+  std::vector<torch::Tensor> reference_outputs;
+  std::vector<torch::Tensor> reference_lses;
+  int64_t sequence_begin = 0;
+  for (const int64_t sequence_end : cumulative_query_lengths) {
+    const int64_t sequence_length = sequence_end - sequence_begin;
+    const auto [sequence_output, sequence_lse] =
+        reference_attention(query.narrow(0, sequence_begin, sequence_length),
+                            key.narrow(0, sequence_begin, sequence_length),
+                            value.narrow(0, sequence_begin, sequence_length),
+                            scale,
+                            /*causal=*/true);
+    reference_outputs.emplace_back(sequence_output);
+    reference_lses.emplace_back(sequence_lse);
+    sequence_begin = sequence_end;
+  }
+  const torch::Tensor reference_output = torch::cat(reference_outputs, 0);
+  const torch::Tensor reference_lse = torch::cat(reference_lses, 0);
+  const float output_max_diff = max_abs_diff(reference_output, output);
+  const float lse_max_diff = max_abs_diff(reference_lse, lse);
+  LOG(INFO) << "[DCP4-probe][raw-multi-token] output_max_diff="
+            << output_max_diff << " lse_max_diff=" << lse_max_diff
+            << " output_shape=" << output.sizes()
+            << " lse_shape=" << lse.sizes();
+  EXPECT_LT(output_max_diff, 3e-2f);
+  EXPECT_LT(lse_max_diff, 3e-2f);
+}
+
+TEST_F(FiaDecodeLseProbe, MultiTokenPagedContextTruncatesSharedPartialBlock) {
+  const int64_t num_heads = 8;
+  const int64_t num_kv_heads = 1;
+  const int64_t head_dim = 128;
+  const int64_t block_size = 128;
+  const int64_t num_blocks = 4;
+  const int64_t context_len = 130;
+  const int64_t token_count = 5;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+  const torch::TensorOptions options =
+      torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
+
+  const torch::Tensor query =
+      torch::randn({token_count, num_heads, head_dim}, options) * 0.1;
+  torch::Tensor context_key =
+      torch::randn({context_len, num_kv_heads, head_dim}, options) * 0.1;
+  torch::Tensor context_value =
+      torch::randn({context_len, num_kv_heads, head_dim}, options) * 0.1;
+  torch::Tensor k_cache =
+      torch::zeros({num_blocks, block_size, num_kv_heads, head_dim}, options);
+  torch::Tensor v_cache = torch::zeros_like(k_cache);
+
+  std::vector<int32_t> context_slots;
+  context_slots.reserve(context_len);
+  for (int64_t token = 0; token < context_len; ++token) {
+    const int64_t physical_block = token < block_size ? 1 : 3;
+    const int64_t block_offset = token % block_size;
+    context_slots.emplace_back(
+        static_cast<int32_t>(physical_block * block_size + block_offset));
+  }
+  write_paged_kv_cache(
+      context_key, context_value, k_cache, v_cache, context_slots, device_);
+
+  const torch::Tensor block_table =
+      torch::tensor(std::vector<int32_t>{0, 2, 1, 3},
+                    torch::TensorOptions().dtype(torch::kInt32))
+          .to(device_)
+          .view({2, 2});
+  const std::vector<int64_t> cumulative_query_lengths = {2, 5};
+  const std::vector<int64_t> local_context_lengths = {0, context_len};
+  const torch::Tensor k_view =
+      k_cache.view({k_cache.size(0), k_cache.size(1), -1});
+  const torch::Tensor v_view =
+      v_cache.view({v_cache.size(0), v_cache.size(1), -1});
+  const auto [baseline_output, baseline_lse] =
+      npu_fused_infer_attention(query,
+                                k_view,
+                                v_view,
+                                /*atten_mask=*/std::nullopt,
+                                std::make_optional(block_table),
+                                cumulative_query_lengths,
+                                local_context_lengths,
+                                num_heads,
+                                num_kv_heads,
+                                scale,
+                                block_size,
+                                /*sparse_mode=*/0,
+                                "TND",
+                                /*softmax_lse_flag=*/true);
+  ASSERT_EQ(aclrtSynchronizeStream(c10_npu::getCurrentNPUStream().stream()),
+            ACL_SUCCESS);
+
+  torch::Tensor current_key =
+      torch::full({3, num_kv_heads, head_dim}, 50.0, options);
+  torch::Tensor current_value =
+      torch::full({3, num_kv_heads, head_dim}, 100.0, options);
+  const std::vector<int32_t> current_slots = {
+      static_cast<int32_t>(3 * block_size + 2),
+      static_cast<int32_t>(3 * block_size + 3),
+      static_cast<int32_t>(3 * block_size + 4)};
+  write_paged_kv_cache(
+      current_key, current_value, k_cache, v_cache, current_slots, device_);
+  const auto [polluted_output, polluted_lse] =
+      npu_fused_infer_attention(query,
+                                k_view,
+                                v_view,
+                                /*atten_mask=*/std::nullopt,
+                                std::make_optional(block_table),
+                                cumulative_query_lengths,
+                                local_context_lengths,
+                                num_heads,
+                                num_kv_heads,
+                                scale,
+                                block_size,
+                                /*sparse_mode=*/0,
+                                "TND",
+                                /*softmax_lse_flag=*/true);
+  ASSERT_EQ(aclrtSynchronizeStream(c10_npu::getCurrentNPUStream().stream()),
+            ACL_SUCCESS);
+
+  ASSERT_EQ(polluted_output.sizes(),
+            torch::IntArrayRef({token_count, num_heads, head_dim}));
+  ASSERT_EQ(polluted_lse.sizes(),
+            torch::IntArrayRef({token_count, num_heads, 1}));
+  const torch::Tensor positive_query = query.narrow(0, 2, 3);
+  const auto [reference_output, reference_lse] =
+      reference_attention(positive_query,
+                          context_key,
+                          context_value,
+                          scale,
+                          /*causal=*/false);
+  const torch::Tensor baseline_positive_output =
+      baseline_output.narrow(0, 2, 3);
+  const torch::Tensor baseline_positive_lse = baseline_lse.narrow(0, 2, 3);
+  const torch::Tensor polluted_positive_output =
+      polluted_output.narrow(0, 2, 3);
+  const torch::Tensor polluted_positive_lse = polluted_lse.narrow(0, 2, 3);
+  const float output_pollution_diff =
+      max_abs_diff(baseline_positive_output, polluted_positive_output);
+  const float lse_pollution_diff =
+      max_abs_diff(baseline_positive_lse, polluted_positive_lse);
+  const float output_reference_diff =
+      max_abs_diff(reference_output, polluted_positive_output);
+  const float lse_reference_diff =
+      max_abs_diff(reference_lse, polluted_positive_lse);
+  LOG(INFO) << "[DCP4-probe][paged-partial-block] output_pollution_diff="
+            << output_pollution_diff
+            << " lse_pollution_diff=" << lse_pollution_diff
+            << " output_reference_diff=" << output_reference_diff
+            << " lse_reference_diff=" << lse_reference_diff;
+  EXPECT_LT(output_pollution_diff, 1e-3f)
+      << "FIA over-read nonzero current KV beyond local_context_len";
+  EXPECT_LT(lse_pollution_diff, 1e-3f)
+      << "FIA LSE included current KV beyond local_context_len";
+  EXPECT_LT(output_reference_diff, 3e-2f);
+  EXPECT_LT(lse_reference_diff, 3e-2f);
 }
 
 // DCP gathers Q heads across two ranks before each rank runs FIA against its

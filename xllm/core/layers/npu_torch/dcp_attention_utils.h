@@ -22,11 +22,41 @@ limitations under the License.
 
 namespace xllm::layer::detail {
 
+inline constexpr int64_t kMaxDcpChunkedPrefillQueryLen = 2048;
+
 std::vector<int64_t> compute_dcp_local_kv_seq_lens(
     const std::vector<int64_t>& global_kv_seq_lens,
     int32_t dcp_size,
     int32_t dcp_rank,
     int64_t block_size);
+
+// Per-request cached-context length for chunked prefill: the KV that precedes
+// the current chunk, derived as global_kv_seq_len - current_chunk_query_len.
+// q_cu_seq_lens is the cumulative host query length per request.
+std::vector<int64_t> compute_dcp_context_lens(
+    const std::vector<int64_t>& q_cu_seq_lens,
+    const std::vector<int64_t>& global_kv_seq_lens);
+
+// Chunked-prefill counterpart of the decode length validator: query tokens per
+// request may exceed one, so the partial tensors are indexed by token rather
+// than by request.
+std::vector<int64_t> validate_dcp_chunked_lengths(
+    const std::vector<int64_t>& q_cu_seq_lens,
+    const std::vector<int64_t>& global_kv_seq_lens,
+    int64_t token_count);
+
+void validate_dcp_chunked_block_table(const torch::Tensor& local_block_table,
+                                      int64_t request_count);
+
+// Zero the context partial for requests whose local context shard is empty on
+// this rank. Unlike the decode variant, the partial's leading dimension is the
+// flattened token count, so each empty request zeroes its own token range
+// [previous_q_end, q_cu_seq_lens[request]).
+void normalize_zero_dcp_chunked_partials(
+    torch::Tensor& partial_out,
+    torch::Tensor& partial_lse,
+    const std::vector<int64_t>& local_context_lens,
+    const std::vector<int64_t>& q_cu_seq_lens);
 
 torch::Tensor merge_dcp_partials(const torch::Tensor& all_partial_out,
                                  const torch::Tensor& all_partial_lse);

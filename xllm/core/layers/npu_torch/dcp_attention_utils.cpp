@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <limits>
 #include <tuple>
 
 namespace xllm::layer::detail {
@@ -44,6 +45,108 @@ std::vector<int64_t> compute_dcp_local_kv_seq_lens(
     local_kv_seq_lens.emplace_back(base + local_remainder);
   }
   return local_kv_seq_lens;
+}
+
+std::vector<int64_t> compute_dcp_context_lens(
+    const std::vector<int64_t>& q_cu_seq_lens,
+    const std::vector<int64_t>& global_kv_seq_lens) {
+  CHECK(!q_cu_seq_lens.empty())
+      << "chunked prefill requires cumulative query lengths";
+  CHECK_EQ(q_cu_seq_lens.size(), global_kv_seq_lens.size())
+      << "chunked prefill requires one query and KV length per request";
+
+  std::vector<int64_t> context_lens;
+  context_lens.reserve(global_kv_seq_lens.size());
+  int64_t previous_q_end = 0;
+  for (size_t request_index = 0; request_index < global_kv_seq_lens.size();
+       ++request_index) {
+    const int64_t q_end = q_cu_seq_lens[request_index];
+    const int64_t query_len = q_end - previous_q_end;
+    const int64_t context_len = global_kv_seq_lens[request_index] - query_len;
+    CHECK_GE(context_len, 0)
+        << "chunked prefill context length must be non-negative";
+    context_lens.emplace_back(context_len);
+    previous_q_end = q_end;
+  }
+  return context_lens;
+}
+
+std::vector<int64_t> validate_dcp_chunked_lengths(
+    const std::vector<int64_t>& q_cu_seq_lens,
+    const std::vector<int64_t>& global_kv_seq_lens,
+    int64_t token_count) {
+  CHECK(!q_cu_seq_lens.empty())
+      << "DCP chunked prefill requires host cumulative query lengths.";
+
+  const size_t query_begin = q_cu_seq_lens.front() == 0 ? 1 : 0;
+  CHECK_LT(query_begin, q_cu_seq_lens.size())
+      << "DCP chunked prefill requires at least one request.";
+  const std::vector<int64_t> normalized_q_cu_seq_lens(
+      q_cu_seq_lens.begin() + query_begin, q_cu_seq_lens.end());
+
+  CHECK_EQ(normalized_q_cu_seq_lens.size(), global_kv_seq_lens.size())
+      << "DCP chunked prefill requires one query and KV length per request.";
+
+  int64_t previous_q_end = 0;
+  for (size_t request_index = 0;
+       request_index < normalized_q_cu_seq_lens.size();
+       ++request_index) {
+    const int64_t q_end = normalized_q_cu_seq_lens[request_index];
+    const int64_t query_len = q_end - previous_q_end;
+    CHECK_GE(query_len, 1)
+        << "DCP chunked prefill requires at least one query token per request.";
+    CHECK_LE(query_len, kMaxDcpChunkedPrefillQueryLen)
+        << "DCP chunked prefill does not yet support chunked query length "
+           "above "
+        << kMaxDcpChunkedPrefillQueryLen << ".";
+    CHECK_GE(global_kv_seq_lens[request_index], query_len)
+        << "DCP chunked prefill KV length must cover the current chunk query.";
+    previous_q_end = q_end;
+  }
+  CHECK_EQ(previous_q_end, token_count)
+      << "DCP chunked cumulative query lengths do not match query tokens.";
+  return normalized_q_cu_seq_lens;
+}
+
+void validate_dcp_chunked_block_table(const torch::Tensor& local_block_table,
+                                      int64_t request_count) {
+  CHECK(local_block_table.defined())
+      << "DCP chunked local block table must be defined.";
+  CHECK_EQ(local_block_table.dim(), 2)
+      << "DCP chunked local block table must be two-dimensional.";
+  CHECK_EQ(local_block_table.size(0), request_count)
+      << "DCP local block table batch size does not match request count.";
+}
+
+void normalize_zero_dcp_chunked_partials(
+    torch::Tensor& partial_out,
+    torch::Tensor& partial_lse,
+    const std::vector<int64_t>& local_context_lens,
+    const std::vector<int64_t>& q_cu_seq_lens) {
+  CHECK_EQ(partial_out.scalar_type(), torch::kFloat32);
+  CHECK_EQ(partial_lse.scalar_type(), torch::kFloat32);
+  CHECK_EQ(partial_out.dim(), 3);
+  CHECK_EQ(partial_lse.dim(), 3);
+  CHECK_EQ(partial_out.size(0), partial_lse.size(0));
+  CHECK_EQ(partial_out.size(1), partial_lse.size(1));
+  CHECK_EQ(partial_lse.size(2), 1);
+  CHECK_EQ(local_context_lens.size(), q_cu_seq_lens.size());
+
+  int64_t previous_q_end = 0;
+  for (size_t request_index = 0; request_index < local_context_lens.size();
+       ++request_index) {
+    const int64_t q_end = q_cu_seq_lens[request_index];
+    const int64_t query_len = q_end - previous_q_end;
+    CHECK_GE(query_len, 1);
+    CHECK_GE(local_context_lens[request_index], 0);
+    if (local_context_lens[request_index] == 0) {
+      partial_out.narrow(0, previous_q_end, query_len).zero_();
+      partial_lse.narrow(0, previous_q_end, query_len)
+          .fill_(-std::numeric_limits<float>::infinity());
+    }
+    previous_q_end = q_end;
+  }
+  CHECK_EQ(previous_q_end, partial_out.size(0));
 }
 
 torch::Tensor merge_dcp_partials(const torch::Tensor& all_partial_out,

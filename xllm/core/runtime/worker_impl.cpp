@@ -913,11 +913,11 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
         processed_input.kv_slot_layout == KvSlotLayout::LOGICAL_REAL) {
       const BatchForwardType& batch_forward_type =
           processed_input.input_params.meta.batch_forward_type;
-      CHECK(batch_forward_type.is_prefill() || batch_forward_type.is_decode() ||
-            batch_forward_type.is_empty())
-          << "DCP-1c supports only normal full prefill and decode cache "
-             "writes; chunked and mixed batches require DCP-2 layout "
-             "support.";
+      CHECK(batch_forward_type.is_prefill() ||
+            batch_forward_type.is_chunked_prefill() ||
+            batch_forward_type.is_decode() || batch_forward_type.is_empty())
+          << "DCP supports normal full prefill, chunked prefill, and decode "
+             "cache writes; mixed batches require DCP-2 layout support.";
       CHECK(!processed_input.input_params.is_spec_verify)
           << "DCP-1c does not support speculative verification cache writes.";
       CHECK(!processed_input.input_params.enable_graph)

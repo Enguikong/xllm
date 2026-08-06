@@ -126,5 +126,123 @@ TEST(DcpAttentionUtilsTest, DistributesPartialTailAcrossFourRanks) {
   EXPECT_EQ(local_kv_seq_lens, (std::vector<int64_t>{128, 128, 1, 0}));
 }
 
+TEST(DcpAttentionUtilsTest, ContextLenIsKvMinusCurrentChunkQuery) {
+  // Two requests packed into one chunked batch: request 0 has 130 query tokens
+  // over a 130 KV (no cached context, first chunk); request 1 has 6 query
+  // tokens over a 262 KV (256 cached context + 6 current chunk).
+  const std::vector<int64_t> context_lens = detail::compute_dcp_context_lens(
+      /*q_cu_seq_lens=*/{130, 136},
+      /*global_kv_seq_lens=*/{130, 262});
+  EXPECT_EQ(context_lens, (std::vector<int64_t>{0, 256}));
+}
+
+TEST(DcpAttentionUtilsTest, ContextShardLenReadsOnlyCachedContext) {
+  // A request with 256 cached context + a current chunk: the local context
+  // shard length must be derived from context_len (256), not the full KV, so
+  // the context part never reads the current chunk's own KV.
+  std::vector<int64_t> context_shard_lens;
+  context_shard_lens.reserve(2);
+  for (int32_t dcp_rank = 0; dcp_rank < 2; ++dcp_rank) {
+    const std::vector<int64_t> rank_shard =
+        detail::compute_dcp_local_kv_seq_lens(
+            /*global_kv_seq_lens=*/{256},
+            /*dcp_size=*/2,
+            dcp_rank,
+            /*block_size=*/128);
+    ASSERT_EQ(rank_shard.size(), 1);
+    context_shard_lens.emplace_back(rank_shard.front());
+  }
+  EXPECT_EQ(context_shard_lens, (std::vector<int64_t>{128, 128}));
+}
+
+TEST(DcpAttentionUtilsTest, ValidateChunkedLengthsAcceptsMultiTokenRequests) {
+  const std::vector<int64_t> normalized_q_cu_seq_lens =
+      detail::validate_dcp_chunked_lengths(
+          /*q_cu_seq_lens=*/{130, 136},
+          /*global_kv_seq_lens=*/{130, 262},
+          /*token_count=*/136);
+  EXPECT_EQ(normalized_q_cu_seq_lens, (std::vector<int64_t>{130, 136}));
+}
+
+TEST(DcpAttentionUtilsTest, NormalizesLeadingZeroBeforeValidation) {
+  const std::vector<int64_t> normalized_q_cu_seq_lens =
+      detail::validate_dcp_chunked_lengths(
+          /*q_cu_seq_lens=*/{0, 130, 136},
+          /*global_kv_seq_lens=*/{130, 262},
+          /*token_count=*/136);
+  EXPECT_EQ(normalized_q_cu_seq_lens, (std::vector<int64_t>{130, 136}));
+  EXPECT_EQ(detail::compute_dcp_context_lens(normalized_q_cu_seq_lens,
+                                             /*global_kv_seq_lens=*/{130, 262}),
+            (std::vector<int64_t>{0, 256}));
+}
+
+TEST(DcpAttentionUtilsTest, ValidateChunkedLengthsRejectsTokenCountMismatch) {
+  EXPECT_DEATH(detail::validate_dcp_chunked_lengths(
+                   /*q_cu_seq_lens=*/{130, 136},
+                   /*global_kv_seq_lens=*/{130, 262},
+                   /*token_count=*/135),
+               "query tokens");
+}
+
+TEST(DcpAttentionUtilsTest, ValidateChunkedLengthsRejectsKvShorterThanQuery) {
+  EXPECT_DEATH(detail::validate_dcp_chunked_lengths(
+                   /*q_cu_seq_lens=*/{10},
+                   /*global_kv_seq_lens=*/{4},
+                   /*token_count=*/10),
+               "cover the current chunk query");
+}
+
+TEST(DcpAttentionUtilsTest, ValidateChunkedLengthsRejectsZeroQueryRequest) {
+  EXPECT_DEATH(detail::validate_dcp_chunked_lengths(
+                   /*q_cu_seq_lens=*/{0, 0, 1},
+                   /*global_kv_seq_lens=*/{0, 1},
+                   /*token_count=*/1),
+               "at least one query token");
+}
+
+TEST(DcpAttentionUtilsTest, ValidateChunkedLengthsRejectsQueryAboveMaskLimit) {
+  EXPECT_DEATH(
+      detail::validate_dcp_chunked_lengths(
+          /*q_cu_seq_lens=*/{detail::kMaxDcpChunkedPrefillQueryLen + 1},
+          /*global_kv_seq_lens=*/{detail::kMaxDcpChunkedPrefillQueryLen + 1},
+          /*token_count=*/
+          detail::kMaxDcpChunkedPrefillQueryLen + 1),
+      "does not yet support chunked query length above");
+}
+
+TEST(DcpAttentionUtilsTest, BlockTableRowsMatchRequestsNotQueryTokens) {
+  const torch::Tensor local_block_table = torch::tensor(
+      {{37, 89}, {41, 73}}, torch::TensorOptions().dtype(torch::kInt64));
+  detail::validate_dcp_chunked_block_table(local_block_table,
+                                           /*request_count=*/2);
+  EXPECT_DEATH(detail::validate_dcp_chunked_block_table(local_block_table,
+                                                        /*request_count=*/136),
+               "request count");
+}
+
+TEST(DcpAttentionUtilsTest, NormalizeChunkedZeroesEmptyContextTokenRange) {
+  const torch::TensorOptions options =
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32);
+  // token_count=5: request 0 owns tokens [0,2) with empty context on this rank,
+  // request 1 owns tokens [2,5) with a non-empty context shard.
+  torch::Tensor partial_out = torch::ones({5, 2, 3}, options);
+  torch::Tensor partial_lse = torch::ones({5, 2, 1}, options);
+
+  detail::normalize_zero_dcp_chunked_partials(partial_out,
+                                              partial_lse,
+                                              /*local_context_lens=*/{0, 64},
+                                              /*q_cu_seq_lens=*/{2, 5});
+
+  EXPECT_TRUE(torch::equal(partial_out.narrow(0, 0, 2),
+                           torch::zeros({2, 2, 3}, options)));
+  EXPECT_TRUE(torch::equal(partial_out.narrow(0, 2, 3),
+                           torch::ones({3, 2, 3}, options)));
+  const torch::Tensor expected_neg_inf_lse =
+      torch::full({2, 2, 1}, -std::numeric_limits<float>::infinity(), options);
+  EXPECT_TRUE(torch::equal(partial_lse.narrow(0, 0, 2), expected_neg_inf_lse));
+  EXPECT_TRUE(torch::equal(partial_lse.narrow(0, 2, 3),
+                           torch::ones({3, 2, 1}, options)));
+}
+
 }  // namespace
 }  // namespace xllm::layer::test

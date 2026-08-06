@@ -26,7 +26,7 @@ namespace {
 Options dcp_options_with_supported_feature_flags() {
   Options options;
   options.decode_context_parallel_size(2)
-      .enable_chunked_prefill(false)
+      .enable_chunked_prefill(true)
       .enable_prefix_cache(false)
       .enable_schedule_overlap(false)
       .enable_disagg_pd(false)
@@ -56,13 +56,12 @@ TEST(DcpCompatTest, AllowsSupportedFirstVersionFeatureFlags) {
       validate_dcp_first_version_options(options, EngineType::LLM).has_value());
 }
 
-TEST(DcpCompatTest, RejectsDefaultChunkedPrefillFirst) {
-  Options options;
-  options.decode_context_parallel_size(2);
+TEST(DcpCompatTest, AllowsChunkedPrefill) {
+  Options options = dcp_options_with_supported_feature_flags();
+  options.enable_chunked_prefill(true);
 
-  expect_error_contains(
-      validate_dcp_first_version_options(options, EngineType::LLM),
-      "enable_chunked_prefill=false");
+  EXPECT_FALSE(
+      validate_dcp_first_version_options(options, EngineType::LLM).has_value());
 }
 
 TEST(DcpCompatTest, AllowsPrefixCache) {
