@@ -1044,13 +1044,33 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     q_cu_seq_lens_.copy_(q_cu_seq_lens_default_, /*non_blocking=*/true);
   }
   const bool has_q_cu = params.attention.device.q_cu_seq_lens.defined() &&
-                        params.attention.device.q_cu_seq_lens.dim() >= 1;
-  const int64_t q_cu_size =
-      (has_q_cu && params.attention.device.q_cu_seq_lens.numel() > 0)
-          ? params.attention.device.q_cu_seq_lens.size(0)
-          : 0;
-  if (has_q_cu && q_cu_size > 0) {
-    const bool use_hybrid_query_start_loc = is_hybrid_linear_attention_;
+                        params.attention.device.q_cu_seq_lens.dim() >= 1 &&
+                        params.attention.device.q_cu_seq_lens.numel() > 0;
+  const bool use_hybrid_query_start_loc = is_hybrid_linear_attention_;
+  const bool synthesize_empty_hybrid_q_cu =
+      !has_q_cu && is_hybrid_spec_verify_chunked_prefill &&
+      is_empty_dp_graph_rank;
+  const auto pad_q_cu_seq_lens = [&](int32_t offset) {
+    if (padded_batch_size <= actual_seq_len_rows) {
+      return;
+    }
+    std::vector<int32_t> padded_q_cu_seq_lens;
+    padded_q_cu_seq_lens.reserve(padded_batch_size - actual_seq_len_rows);
+    const int32_t padding_q_len = is_chunked_prefill ? q_max_seq_len : 1;
+    for (int64_t i = actual_seq_len_rows; i < padded_batch_size; ++i) {
+      offset += padding_q_len;
+      padded_q_cu_seq_lens.emplace_back(offset);
+    }
+    const int64_t padding_start =
+        actual_seq_len_rows + (use_hybrid_query_start_loc ? 1 : 0);
+    const int64_t padding_end =
+        padded_batch_size + (use_hybrid_query_start_loc ? 1 : 0);
+    q_cu_seq_lens_
+        .slice(/*dim=*/0, /*start=*/padding_start, /*end=*/padding_end)
+        .copy_(torch::tensor(padded_q_cu_seq_lens, torch::kInt).to(device_),
+               /*non_blocking=*/true);
+  };
+  if (has_q_cu) {
     const bool input_has_leading_zero =
         params.is_spec_verify && use_hybrid_query_start_loc;
     const int64_t required_q_cu_seq_lens =
@@ -1075,27 +1095,12 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                      /*dim=*/0, /*start=*/0, /*end=*/required_q_cu_seq_lens),
                  /*non_blocking=*/true);
     }
-    if (padded_batch_size > actual_seq_len_rows) {
-      int32_t offset =
-          is_empty_dp_graph_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
-      std::vector<int32_t> padded_q_cu_seq_lens;
-      padded_q_cu_seq_lens.reserve(padded_batch_size - actual_seq_len_rows);
-      const int32_t padding_q_len = is_chunked_prefill ? q_max_seq_len : 1;
-      for (int64_t i = actual_seq_len_rows; i < padded_batch_size; ++i) {
-        offset += padding_q_len;
-        padded_q_cu_seq_lens.emplace_back(offset);
-      }
-      const int64_t padding_start =
-          actual_seq_len_rows + (use_hybrid_query_start_loc ? 1 : 0);
-      const int64_t padding_end =
-          padded_batch_size + (use_hybrid_query_start_loc ? 1 : 0);
-      q_cu_seq_lens_
-          .slice(/*dim=*/0,
-                 /*start=*/padding_start,
-                 /*end=*/padding_end)
-          .copy_(torch::tensor(padded_q_cu_seq_lens, torch::kInt).to(device_),
-                 /*non_blocking=*/true);
-    }
+    const int32_t offset =
+        is_empty_dp_graph_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
+    pad_q_cu_seq_lens(offset);
+  } else if (synthesize_empty_hybrid_q_cu) {
+    q_cu_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/1).zero_();
+    pad_q_cu_seq_lens(/*offset=*/0);
   }
 
   // Expanded Qwen hybrid spec verification is represented as chunked prefill
@@ -1352,8 +1357,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           uses_paged_attention_tiling() ? tiling_data() : torch::Tensor();
       graph_params->graph.expanded_kv_seq_lens_vec = expanded_kv_seq_lens_vec;
     }
-    if (params.attention.device.q_cu_seq_lens.defined()) {
-      const bool use_hybrid_query_start_loc = is_hybrid_linear_attention_;
+    if (params.attention.device.q_cu_seq_lens.defined() ||
+        synthesize_empty_hybrid_q_cu) {
       graph_params->attention.device.q_cu_seq_lens = q_cu_seq_lens_.slice(
           /*dim=*/0,
           /*start=*/0,

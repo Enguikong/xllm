@@ -40,6 +40,7 @@ limitations under the License.
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/layers/common/attention_metadata.h"
+#include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/npu/npu_lm_head_impl.h"
 #include "core/layers/npu/npu_word_embedding_impl.h"
 #include "core/layers/npu_torch/tests_utils.h"
@@ -127,6 +128,35 @@ class EmptyValidateTestMTPWorker final : public MTPWorkerImpl {
     prepare_empty_validate_inputs(input, validate_input);
     return validate_input;
   }
+
+  bool should_use_explicit_spec_verify_replay_update_for_test(
+      const ForwardInput& input) {
+    target_spec_verify_mode_ =
+        mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY;
+    return should_use_explicit_spec_verify_replay_update(input);
+  }
+};
+
+class ScopedGraphNoPaddingConfig final {
+ public:
+  ScopedGraphNoPaddingConfig()
+      : config_(ExecutionConfig::get_instance()),
+        original_enable_graph_(config_.enable_graph()),
+        original_enable_graph_mode_decode_no_padding_(
+            config_.enable_graph_mode_decode_no_padding()) {
+    config_.enable_graph(true).enable_graph_mode_decode_no_padding(true);
+  }
+
+  ~ScopedGraphNoPaddingConfig() {
+    config_.enable_graph(original_enable_graph_)
+        .enable_graph_mode_decode_no_padding(
+            original_enable_graph_mode_decode_no_padding_);
+  }
+
+ private:
+  ExecutionConfig& config_;
+  bool original_enable_graph_;
+  bool original_enable_graph_mode_decode_no_padding_;
 };
 
 const KVCache& first_full_attention_cache(
@@ -1143,6 +1173,46 @@ TEST(MTPWorkerImplTest, EmptyRankUsesExpandedSpecVerifyTargetLayout) {
   EXPECT_FALSE(params.graph.spec_verify_source_addresses_stable);
 }
 
+TEST(MTPWorkerImplTest,
+     ExplicitSpecVerifyReplayUpdateRequiresDpCountsMatchLocalBatch) {
+  constexpr int32_t kSpeculativeTokens = 3;
+  constexpr int32_t kBlockSize = 128;
+  const torch::Device device("npu:0");
+  layer::test::MockProcessGroup process_group(
+      device, /*rank=*/0, /*world_size=*/1);
+  ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, &process_group);
+  runtime::Options options;
+  options.num_speculative_tokens(kSpeculativeTokens).block_size(kBlockSize);
+  EmptyValidateTestMTPWorker worker(parallel_args, device, options);
+  ScopedGraphNoPaddingConfig config;
+
+  const auto make_input = [](int32_t num_sequences,
+                             std::vector<int32_t> dp_token_nums) {
+    ForwardInput input;
+    input.input_params.meta.num_sequences = num_sequences;
+    input.input_params.parallel.dp_global_token_nums = dp_token_nums;
+    input.input_params.attention.host.block_tables =
+        torch::zeros({num_sequences, 1}, torch::kInt32);
+    return input;
+  };
+
+  EXPECT_TRUE(worker.should_use_explicit_spec_verify_replay_update_for_test(
+      make_input(/*num_sequences=*/1, {})));
+  EXPECT_TRUE(worker.should_use_explicit_spec_verify_replay_update_for_test(
+      make_input(/*num_sequences=*/1, {1})));
+  EXPECT_TRUE(worker.should_use_explicit_spec_verify_replay_update_for_test(
+      make_input(/*num_sequences=*/1, {1, 1})));
+  EXPECT_FALSE(worker.should_use_explicit_spec_verify_replay_update_for_test(
+      make_input(/*num_sequences=*/1, {1, 0})));
+  EXPECT_FALSE(worker.should_use_explicit_spec_verify_replay_update_for_test(
+      make_input(/*num_sequences=*/1, {1, 4})));
+  EXPECT_FALSE(worker.should_use_explicit_spec_verify_replay_update_for_test(
+      make_input(/*num_sequences=*/1, {4, 4})));
+  EXPECT_TRUE(worker.should_use_explicit_spec_verify_replay_update_for_test(
+      make_input(/*num_sequences=*/4, {4, 4})));
+}
+
 TEST(AclGraphPersistentParamTest,
      EmptyHybridMtpSpecVerifyDpGraphPadsDummyExpandedMetadata) {
   constexpr int32_t kSpecWidth = 4;
@@ -1195,7 +1265,9 @@ TEST(AclGraphPersistentParamTest,
                               positions,
                               params,
                               kSpecWidth,
-                              true);
+                              /*return_capture_params=*/true,
+                              /*skip_token_update=*/false,
+                              /*for_capture=*/true);
 
   ASSERT_TRUE(params_for_capture.has_value());
   EXPECT_EQ(params_for_capture->meta.actual_num_sequences, 0);
@@ -1209,6 +1281,11 @@ TEST(AclGraphPersistentParamTest,
             std::vector<int64_t>({0}));
   EXPECT_EQ(params_for_capture->parallel.query_start_loc,
             std::vector<int64_t>({0, kSpecWidth}));
+  ASSERT_TRUE(params_for_capture->attention.device.q_cu_seq_lens.defined());
+  EXPECT_EQ(params_for_capture->attention.device.q_cu_seq_lens.numel(), 2);
+  EXPECT_TRUE(
+      torch::equal(params_for_capture->attention.device.q_cu_seq_lens.cpu(),
+                   torch::tensor({0, kSpecWidth}, torch::kInt32)));
   EXPECT_TRUE(
       params_for_capture->graph.use_expanded_decode_for_spec_verify_attention);
   EXPECT_TRUE(params_for_capture->graph.expanded_kv_seq_lens.defined());
@@ -1223,6 +1300,18 @@ TEST(AclGraphPersistentParamTest,
                    torch::zeros_like(
                        params_for_capture->graph.expanded_block_tables.cpu())));
   EXPECT_FALSE(params_for_capture->graph.attn_mask.defined());
+
+  params_for_capture->graph.tiling_data = torch::zeros({1}, int_options);
+  const layer::AttentionMetadata attn_metadata =
+      layer::AttentionMetadataBuilder::build(*params_for_capture,
+                                             /*enable_mla=*/false,
+                                             /*attn_mask=*/{},
+                                             device);
+  EXPECT_FALSE(attn_metadata.is_dummy);
+  ASSERT_TRUE(attn_metadata.q_cu_seq_lens.defined());
+  EXPECT_EQ(attn_metadata.q_cu_seq_lens.numel(), 2);
+  EXPECT_TRUE(torch::equal(attn_metadata.q_cu_seq_lens.cpu(),
+                           torch::tensor({0, kSpecWidth}, torch::kInt32)));
 }
 
 TEST(AclGraphPersistentParamTest,
@@ -1538,8 +1627,11 @@ TEST(AclGraphPersistentParamTest,
   params.meta.q_max_seq_len = kSpecWidth;
   params.attention.host.q_seq_lens = {kSpecWidth};
   params.attention.host.kv_seq_lens = {20};
+  params.attention.host.q_cu_seq_lens = {0, kSpecWidth};
   params.attention.device.q_seq_lens = torch::tensor({kSpecWidth}, int_options);
   params.attention.device.kv_seq_lens = torch::tensor({20}, int_options);
+  params.attention.device.q_cu_seq_lens =
+      torch::tensor({0, kSpecWidth}, int_options);
   params.attention.device.new_cache_slots =
       torch::arange(kSpecWidth, int_options);
   params.attention.device.block_tables =
@@ -1566,6 +1658,8 @@ TEST(AclGraphPersistentParamTest,
   EXPECT_EQ(generic->graph.expanded_block_tables.size(0), kSpecWidth);
   EXPECT_EQ(generic->graph.expanded_block_tables.size(1), capacity);
   EXPECT_TRUE(generic->graph.expanded_block_tables.is_contiguous());
+  EXPECT_TRUE(torch::equal(generic->attention.device.q_cu_seq_lens.cpu(),
+                           torch::tensor({0, kSpecWidth}, torch::kInt32)));
 
   params.graph.spec_verify_source_addresses_stable = true;
   auto stable = persistent_param.update(tokens,
@@ -1579,6 +1673,8 @@ TEST(AclGraphPersistentParamTest,
   EXPECT_EQ(stable->graph.expanded_block_tables.size(0), kSpecWidth);
   EXPECT_EQ(stable->graph.expanded_block_tables.size(1),
             kActiveBlockTableWidth);
+  EXPECT_TRUE(torch::equal(stable->attention.device.q_cu_seq_lens.cpu(),
+                           torch::tensor({0, kSpecWidth}, torch::kInt32)));
 }
 
 TEST(AclGraphPersistentParamTest, AuxHiddenStatesUseGraphTokenCapacity) {

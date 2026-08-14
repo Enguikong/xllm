@@ -743,8 +743,13 @@ bool MTPWorkerImpl::should_use_explicit_spec_verify_replay_update(
   }
   const std::vector<int32_t>& dp_token_nums =
       input.input_params.parallel.dp_global_token_nums;
-  if (std::find(dp_token_nums.begin(), dp_token_nums.end(), 0) !=
-      dp_token_nums.end()) {
+  const int32_t local_num_sequences = input.input_params.meta.num_sequences;
+  if (!dp_token_nums.empty() &&
+      !std::all_of(dp_token_nums.begin(),
+                   dp_token_nums.end(),
+                   [local_num_sequences](int32_t token_num) {
+                     return token_num == local_num_sequences;
+                   })) {
     return false;
   }
   const int64_t block_table_width = spec_verify_block_table_width(block_tables);
