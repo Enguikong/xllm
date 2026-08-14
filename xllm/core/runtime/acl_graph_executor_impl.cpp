@@ -56,10 +56,11 @@ constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
                                         uint32_t bucket_num_tokens,
-                                        int64_t block_size) {
+                                        int64_t block_size,
+                                        int32_t dp_size) {
   const int64_t batch_size = params.meta.num_sequences;
   const int64_t spec_width = params.meta.q_max_seq_len;
-  return params.is_spec_verify &&
+  return dp_size == 1 && params.is_spec_verify &&
          params.meta.batch_forward_type.is_chunked_prefill() &&
          params.graph.use_expanded_decode_for_spec_verify_attention &&
          params.graph.spec_verify_source_addresses_stable &&
@@ -362,8 +363,11 @@ bool AclGraph::capture(CausalLM* model,
     graph_task_context_->begin_capture();
     graph_params->graph.acl_graph_task_update_context = graph_task_context_;
   }
-  const bool capture_static_graph_tasks = uses_static_mtp_graph_task_variant(
-      graph_params.value(), num_tokens_, options.block_size());
+  const bool capture_static_graph_tasks =
+      uses_static_mtp_graph_task_variant(graph_params.value(),
+                                         num_tokens_,
+                                         options.block_size(),
+                                         options.dp_size());
   // Synchronize stream to ensure all data is copied to graph persistent buffers
   aclrtSynchronizeStream(stream);
 
@@ -1034,14 +1038,76 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   const uint64_t graph_key =
       get_graph_key(bucket_num_tokens, params_single, attention_plan_class);
+  const bool static_mtp_variant =
+      uses_static_mtp_graph_task_variant(params_single,
+                                         bucket_num_tokens,
+                                         options_.block_size(),
+                                         options_.dp_size());
+  const auto static_signature = make_static_graph_task_signature(params_single);
+  const int64_t block_table_width =
+      params_single.attention.device.block_tables.defined() &&
+              params_single.attention.device.block_tables.dim() == 2
+          ? params_single.attention.device.block_tables.size(1)
+          : -1;
+  const int64_t expanded_block_table_width =
+      params_single.graph.expanded_block_tables.defined() &&
+              params_single.graph.expanded_block_tables.dim() == 2
+          ? params_single.graph.expanded_block_tables.size(1)
+          : -1;
+  const int32_t expanded_kv_max =
+      params_single.graph.expanded_kv_seq_lens_vec.empty()
+          ? -1
+          : *std::max_element(
+                params_single.graph.expanded_kv_seq_lens_vec.begin(),
+                params_single.graph.expanded_kv_seq_lens_vec.end());
+  const int64_t signature_linear_state_id =
+      static_signature.has_value() ? static_signature->linear_state_id : -1;
+  const int64_t signature_num_accepted_tokens =
+      static_signature.has_value() ? static_signature->num_accepted_tokens : -1;
+  const int64_t signature_query_start_loc_begin =
+      static_signature.has_value() ? static_signature->query_start_loc_begin
+                                   : -1;
+  const int64_t signature_query_start_loc_end =
+      static_signature.has_value() ? static_signature->query_start_loc_end : -1;
   std::shared_ptr<AclGraph> replay_graph;
+  size_t active_slot_graph_count = 0;
   {
     std::lock_guard<std::mutex> lock(graph_slots_mutex_);
     auto it = active_slot.graphs.find(graph_key);
     if (it != active_slot.graphs.end()) {
       replay_graph = it->second;
     }
+    active_slot_graph_count = active_slot.graphs.size();
   }
+  VLOG(kGraphExecutorLogVerboseLevel)
+      << "PARTC_GRAPH_DECISION slot=" << slot_idx << ", key=" << graph_key
+      << ", hit=" << (replay_graph != nullptr)
+      << ", slot_graph_count=" << active_slot_graph_count
+      << ", batch_id=" << params_single.meta.batch_id
+      << ", graph_num_tokens=" << graph_num_tokens
+      << ", bucket_num_tokens=" << bucket_num_tokens
+      << ", actual_num_tokens=" << n_tokens
+      << ", num_sequences=" << params_single.meta.num_sequences
+      << ", actual_num_sequences=" << params_single.meta.actual_num_sequences
+      << ", dp_global_token_nums="
+      << params_single.parallel.dp_global_token_nums
+      << ", raw_dp_global_token_nums="
+      << params_single.parallel.raw_dp_global_token_nums
+      << ", source_addresses_stable="
+      << params_single.graph.spec_verify_source_addresses_stable
+      << ", use_expanded="
+      << params_single.graph.use_expanded_decode_for_spec_verify_attention
+      << ", block_table_width=" << block_table_width
+      << ", expanded_block_table_width=" << expanded_block_table_width
+      << ", expanded_kv_max=" << expanded_kv_max
+      << ", attention_plan_class=" << attention_plan_class
+      << ", static_mtp_variant=" << static_mtp_variant
+      << ", static_tasks_prepared="
+      << params_single.graph.spec_verify_static_graph_tasks_prepared
+      << ", signature_linear_state_id=" << signature_linear_state_id
+      << ", signature_num_accepted_tokens=" << signature_num_accepted_tokens
+      << ", signature_query_start_loc_begin=" << signature_query_start_loc_begin
+      << ", signature_query_start_loc_end=" << signature_query_start_loc_end;
 
   if (replay_graph != nullptr) {
     if (!replay_graph->is_replay_compatible(params_single)) {
@@ -1096,8 +1162,6 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
               << bucket_num_tokens << " (actual num_tokens: " << n_tokens
               << ") done";
 
-    const bool static_mtp_variant = uses_static_mtp_graph_task_variant(
-        params_single, bucket_num_tokens, options_.block_size());
     {
       std::lock_guard<std::mutex> lock(graph_slots_mutex_);
       if (static_mtp_variant) {
@@ -1222,7 +1286,8 @@ void AclGraphExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
 bool AclGraphExecutorImpl::prepare_static_mtp_graph_tasks(
     const SpecVerifyGraphTaskSignal& signal,
     const Stream& signal_stream) {
-  if (!model_->is_hybrid_linear_attention() || graph_slot_count_ != 1 ||
+  if (options_.dp_size() != 1 || !model_->is_hybrid_linear_attention() ||
+      graph_slot_count_ != 1 ||
       !kernel::npu::tilelang::has_spec_verify_graph_update_specialization(
           signal.spec_width, options_.block_size()) ||
       signal.block_table_width < 1 ||
@@ -1340,8 +1405,10 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
           << "stable speculative-verify graph requires an attention plan "
              "class";
       const uint64_t base_key = mix_graph_key(packed_key, attention_plan_class);
-      if (uses_static_mtp_graph_task_variant(
-              params, bucket_num_tokens, options_.block_size())) {
+      if (uses_static_mtp_graph_task_variant(params,
+                                             bucket_num_tokens,
+                                             options_.block_size(),
+                                             options_.dp_size())) {
         const auto signature = make_static_graph_task_signature(params);
         CHECK(signature.has_value());
         return static_mtp_graph_task_key(base_key, signature.value());

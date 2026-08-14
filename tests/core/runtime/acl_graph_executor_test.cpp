@@ -135,6 +135,8 @@ class EmptyValidateTestMTPWorker final : public MTPWorkerImpl {
         mtp_async::TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY;
     return should_use_explicit_spec_verify_replay_update(input);
   }
+
+  void ignore_model_declared_block_table_capacity_for_test() { impl_.reset(); }
 };
 
 class ScopedGraphNoPaddingConfig final {
@@ -1185,6 +1187,7 @@ TEST(MTPWorkerImplTest,
   runtime::Options options;
   options.num_speculative_tokens(kSpeculativeTokens).block_size(kBlockSize);
   EmptyValidateTestMTPWorker worker(parallel_args, device, options);
+  worker.ignore_model_declared_block_table_capacity_for_test();
   ScopedGraphNoPaddingConfig config;
 
   const auto make_input = [](int32_t num_sequences,
@@ -1465,6 +1468,60 @@ TEST_F(AclGraphExecutorTest, GraphDoubleBufferFlagControlsSlotCount) {
 
   execution_config.enable_graph_double_buffer(
       original_enable_graph_double_buffer);
+}
+
+TEST_F(AclGraphExecutorTest,
+       StaticMtpGraphTaskVariantsAreDisabledForDataParallel) {
+  constexpr int32_t kSpecWidth = 4;
+  constexpr int64_t kBlockSize = 128;
+  constexpr uint64_t kAttentionPlanClass = 1;
+
+  runtime::Options single_dp_options = options_;
+  single_dp_options.block_size(kBlockSize).dp_size(1);
+  runtime::Options multi_dp_options = single_dp_options;
+  multi_dp_options.dp_size(2);
+
+  auto single_dp_executor = std::make_unique<::xllm::npu::AclGraphExecutorImpl>(
+      model_.get(), model_args_, *device_, single_dp_options);
+  auto multi_dp_executor = std::make_unique<::xllm::npu::AclGraphExecutorImpl>(
+      model_.get(), model_args_, *device_, multi_dp_options);
+
+  const auto make_params = [kSpecWidth](int32_t num_accepted_tokens) {
+    ModelInputParams params;
+    params.is_spec_verify = true;
+    params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+    params.meta.num_sequences = 1;
+    params.meta.q_max_seq_len = kSpecWidth;
+    params.parallel.query_start_loc = {0, kSpecWidth};
+    params.embedding.linear_state_ids = {3};
+    params.num_accepted_tokens_host = {num_accepted_tokens};
+    params.graph.use_expanded_decode_for_spec_verify_attention = true;
+    params.graph.spec_verify_source_addresses_stable = true;
+    params.attention.device.block_tables =
+        torch::zeros({1, 2}, torch::dtype(torch::kInt));
+    params.graph.expanded_block_tables =
+        torch::zeros({kSpecWidth, 2}, torch::dtype(torch::kInt));
+    return params;
+  };
+
+  ModelInputParams accepted_one = make_params(1);
+  ModelInputParams accepted_four = make_params(4);
+  const uint64_t single_dp_key_one = single_dp_executor->get_graph_key_for_test(
+      kSpecWidth, accepted_one, kAttentionPlanClass);
+  const uint64_t single_dp_key_four =
+      single_dp_executor->get_graph_key_for_test(
+          kSpecWidth, accepted_four, kAttentionPlanClass);
+  EXPECT_NE(single_dp_key_one, single_dp_key_four)
+      << "single-DP execution should preserve static graph-task variants";
+
+  accepted_one.parallel.dp_global_token_nums = {kSpecWidth, kSpecWidth};
+  accepted_four.parallel.dp_global_token_nums = {kSpecWidth, kSpecWidth};
+  const uint64_t multi_dp_key_one = multi_dp_executor->get_graph_key_for_test(
+      kSpecWidth, accepted_one, kAttentionPlanClass);
+  const uint64_t multi_dp_key_four = multi_dp_executor->get_graph_key_for_test(
+      kSpecWidth, accepted_four, kAttentionPlanClass);
+  EXPECT_EQ(multi_dp_key_one, multi_dp_key_four)
+      << "multi-DP execution must use the shared dynamic-task graph key";
 }
 
 TEST_F(AclGraphExecutorTest,
