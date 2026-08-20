@@ -1,7 +1,6 @@
 include(cc_test)
 
 cc_test(
-  NO_NPU_RUNTIME
   NAME
     npu_dcp_attention_utils_test
   SRCS
