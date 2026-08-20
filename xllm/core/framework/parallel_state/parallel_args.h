@@ -154,6 +154,8 @@ struct ParallelArgs {
 
   PROPERTY(int32_t, dcp_size) = 1;
 
+  PROPERTY(int32_t, layerwise_split_size) = 1;
+
   // Derived: CP rank of the current process within its DP group.
   // rank layout: dp_rank * (cp_size * tp_size) + cp_rank * tp_size + tp_rank
   [[nodiscard]] int32_t cp_rank() const noexcept {

@@ -46,6 +46,7 @@ class ParallelConfig final {
          "cp_size",
          "decode_context_parallel_size",
          "enable_experimental_dcp_chunked_prefill",
+         "layerwise_split_size",
          "tp_size",
          "sp_size",
          "cfg_size",
@@ -74,6 +75,8 @@ class ParallelConfig final {
   // not bitwise-equivalent to dcp=1. Keep false unless explicitly running the
   // experimental path.
   PROPERTY(bool, enable_experimental_dcp_chunked_prefill) = false;
+
+  PROPERTY(int32_t, layerwise_split_size) = 1;
 
   // 0 means follow cp_size (legacy KV-split width).
   PROPERTY(int32_t, kv_split_size) = 1;

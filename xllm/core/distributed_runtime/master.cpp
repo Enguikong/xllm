@@ -48,6 +48,7 @@ limitations under the License.
 #include "framework/parallel_state/npu_rank_table_env.h"
 #endif
 #include "core/platform/device_name_utils.h"
+#include "framework/kv_cache/layerwise_split_layout.h"
 #include "framework/model/model_args.h"
 #include "framework/request/request.h"
 #include "llm_engine.h"
@@ -226,6 +227,42 @@ void apply_runtime_kv_cache_options(const Options& source,
       .prefetch_timeout(source.prefetch_timeout())
       .layers_wise_copy_batchs(source.layers_wise_copy_batchs())
       .kv_cache_dtype(source.kv_cache_dtype());
+}
+
+void validate_layerwise_split_size_startup_config(const Options& options,
+                                                  const std::string& model_type,
+                                                  int32_t global_world_size) {
+  const ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  const int32_t layerwise_split_size = parallel_config.layerwise_split_size();
+  validate_layerwise_split_size_config(layerwise_split_size);
+  if (layerwise_split_size <= 1) {
+    return;
+  }
+
+  CHECK_EQ(options.decode_context_parallel_size(), 1)
+      << "layerwise_split_size > 1 does not support decode context "
+         "parallelism.";
+  CHECK_GE(options.dp_size(), 1) << "dp_size must be >= 1.";
+  CHECK_GT(global_world_size, 0) << "world_size must be > 0.";
+  const int32_t dp_cp_size = options.dp_size() * options.cp_size();
+  CHECK_EQ(global_world_size % dp_cp_size, 0)
+      << "world_size (" << global_world_size
+      << ") must be divisible by dp_size * cp_size (" << dp_cp_size << ").";
+  const int32_t attn_tp_size = global_world_size / dp_cp_size;
+  std::string resolved_model_type = model_type;
+  if (resolved_model_type.empty()) {
+    resolved_model_type =
+        util::get_model_type(options.model_path(), options.backend());
+  }
+  validate_layerwise_split_enablement(
+      layerwise_split_size, attn_tp_size, resolved_model_type);
+
+  CHECK_LE(options.host_blocks_factor(), 1.0)
+      << "layerwise_split_size > 1 does not support hierarchy host cache.";
+  CHECK_EQ(parallel_config.cp_size(), 1)
+      << "layerwise_split_size > 1 does not support context parallelism.";
+  CHECK_EQ(parallel_config.kv_split_size_effective(), 1)
+      << "layerwise_split_size > 1 does not support KV split.";
 }
 
 std::optional<std::string> validate_model_cp(const Options& options,
@@ -616,6 +653,8 @@ Master::Master(const Options& options, EngineType type)
         options.eplb_min_peak_load_improvement().value());
   }
 #endif
+  validate_layerwise_split_size_startup_config(
+      options_, model_type, global_world_size);
   ParallelConfig::get_instance().enable_multi_stream_parallel(
       options.enable_multi_stream_parallel() && (options.nnodes() > 1));
   if (ParallelConfig::get_instance().enable_multi_stream_parallel()) {
