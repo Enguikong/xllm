@@ -139,8 +139,8 @@ TEST(AclGraphStaticGraphTaskSignatureTest,
       .num_accepted_tokens = 4,
       .spec_width = 5,
       .block_table_width = 64,
+      .base_kv_seq_len = 252,
       .max_kv_seq_len = 256,
-      .expanded_kv_seq_lens = {252, 253, 254, 255, 256},
   };
 
   const auto captured = npu::make_static_graph_task_signature(params);

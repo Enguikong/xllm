@@ -615,6 +615,14 @@ void AclGraph::prepare_static_graph_tasks(
   auto& causal_conv1d_tasks = graph_task_context_->causal_conv1d_tasks;
   auto& fused_infer_attention_tasks =
       graph_task_context_->fused_infer_attention_tasks;
+  std::vector<int64_t> expanded_kv_seq_lens;
+  if (!fused_infer_attention_tasks.empty()) {
+    CHECK_GT(signal.spec_width, 0);
+    expanded_kv_seq_lens.reserve(static_cast<size_t>(signal.spec_width));
+    for (int64_t token_idx = 0; token_idx < signal.spec_width; ++token_idx) {
+      expanded_kv_seq_lens.emplace_back(signal.base_kv_seq_len + token_idx);
+    }
+  }
 
   auto signal_causal_conv1d_task = [&](CausalConv1dGraphTask& task) {
     CHECK(task.event != nullptr)
@@ -627,7 +635,7 @@ void AclGraph::prepare_static_graph_tasks(
         CHECK(task.branch == FusedInferAttentionGraphBranch::kSpecVerify)
             << "static MTP FIA task must use the spec-verify branch";
         CHECK_EQ(static_cast<size_t>(task.query.size(0)),
-                 signal.expanded_kv_seq_lens.size())
+                 expanded_kv_seq_lens.size())
             << "static MTP FIA KV lengths must match captured query rows";
         c10_npu::graph_task_update_begin(signal_stream, task.handle);
         kernel::npu::npu_fused_infer_attention_decode_out(
@@ -636,7 +644,7 @@ void AclGraph::prepare_static_graph_tasks(
             task.value,
             task.block_table,
             task.actual_seq_lengths,
-            signal.expanded_kv_seq_lens,
+            expanded_kv_seq_lens,
             task.num_heads,
             task.num_key_value_heads,
             task.scale,
@@ -943,7 +951,9 @@ bool AclGraph::prepare_static_mtp_graph_tasks(
   if (!fused_infer_attention_tasks.empty()) {
     const size_t graph_batch_size =
         static_cast<size_t>(fused_infer_attention_tasks.front().query.size(0));
-    if (signal.expanded_kv_seq_lens.size() != graph_batch_size) {
+    if (signal.spec_width != static_cast<int64_t>(graph_batch_size) ||
+        signal.max_kv_seq_len !=
+            signal.base_kv_seq_len + signal.spec_width - 1) {
       return false;
     }
     for (const FusedInferAttentionGraphTask& task :

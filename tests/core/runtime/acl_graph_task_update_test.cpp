@@ -859,6 +859,41 @@ TEST_F(AclGraphTaskUpdateTest,
 }
 
 TEST_F(AclGraphTaskUpdateTest,
+       Qwen35OptOutKeepsPagedAttentionForExpandedSpecVerify) {
+  constexpr int32_t kNumSequences = 2;
+  constexpr int32_t kNumSpecTokens = 4;
+  auto pa_model = std::make_unique<HybridConv1dMockLM>(
+      model_args_, *device_, /*enable_fia_decode=*/false);
+
+  auto batch = create_decode_batch(/*batch_size=*/kNumSequences);
+  ASSERT_FALSE(batch->empty());
+  auto forward_input = batch->prepare_forward_input(
+      options_.num_decoding_tokens(), 0, model_args_);
+  forward_input = forward_input.to(*device_, kDtype);
+  setup_spec_verify_input(forward_input, kNumSequences, kNumSpecTokens);
+
+  auto kv_eager = create_hybrid_kv_caches();
+  auto eager_out = pa_model->forward(forward_input.token_ids,
+                                     forward_input.positions,
+                                     kv_eager,
+                                     forward_input.input_params);
+
+  auto kv_graph = create_hybrid_kv_caches();
+  auto graph_exec = std::make_unique<npu::AclGraphExecutorImpl>(
+      pa_model.get(), model_args_, *device_, options_);
+  auto graph_out = graph_exec->run(forward_input.token_ids,
+                                   forward_input.positions,
+                                   kv_graph,
+                                   forward_input.input_params);
+
+  EXPECT_TRUE(pa_model->saw_causal_conv_graph_task());
+  EXPECT_FALSE(pa_model->saw_fia_graph_task());
+  EXPECT_EQ(eager_out.hidden_states.sizes(), graph_out.hidden_states.sizes());
+  EXPECT_TRUE(torch::isfinite(eager_out.hidden_states).all().item<bool>());
+  EXPECT_TRUE(torch::isfinite(graph_out.hidden_states).all().item<bool>());
+}
+
+TEST_F(AclGraphTaskUpdateTest,
        ReplayWithDifferentParamsProducesDifferentOutputs) {
   std::vector<std::vector<int32_t>> prompts_run1 = {{1, 3, 5, 7}, {2, 4, 6, 8}};
   auto batch1 =

@@ -304,19 +304,6 @@ void AttentionImpl::decoder_forward(torch::Tensor& query,
     kv_seq_lens = attn_metadata.kv_seq_lens;
   }
 
-  std::vector<int64_t> expanded_kv_seq_lens;
-  const std::vector<int64_t>* kv_seq_lens_vec =
-      &attn_metadata.kv_seq_lens_host_vec;
-  if (attn_metadata.expanded_decode.enabled) {
-    expanded_kv_seq_lens.reserve(
-        attn_metadata.expanded_decode.kv_seq_lens_host_vec.size());
-    for (int32_t kv_seq_len :
-         attn_metadata.expanded_decode.kv_seq_lens_host_vec) {
-      expanded_kv_seq_lens.emplace_back(kv_seq_len);
-    }
-    kv_seq_lens_vec = &expanded_kv_seq_lens;
-  }
-
   const bool use_fia_graph_decode =
       enable_fia_decode_ &&
       (!attn_metadata.is_spec_verify || attn_metadata.expanded_decode.enabled);
@@ -341,6 +328,19 @@ void AttentionImpl::decoder_forward(torch::Tensor& query,
                                     kv_seq_lens,
                                     output);
     return;
+  }
+
+  std::vector<int64_t> expanded_kv_seq_lens;
+  const std::vector<int64_t>* kv_seq_lens_vec =
+      &attn_metadata.kv_seq_lens_host_vec;
+  if (attn_metadata.expanded_decode.enabled) {
+    expanded_kv_seq_lens.reserve(
+        attn_metadata.expanded_decode.kv_seq_lens_host_vec.size());
+    for (int32_t kv_seq_len :
+         attn_metadata.expanded_decode.kv_seq_lens_host_vec) {
+      expanded_kv_seq_lens.emplace_back(kv_seq_len);
+    }
+    kv_seq_lens_vec = &expanded_kv_seq_lens;
   }
 
   CHECK(v_cache.has_value() && v_cache->defined())
