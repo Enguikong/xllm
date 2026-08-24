@@ -807,19 +807,25 @@ ModelOutput AclGraph::replay(CausalLM* model,
     CHECK(update_stream_.has_value());
     signal_static_graph_tasks(update_stream_.value());
   }
-  // Per-replay completion barrier for the dynamic graph-task path (DCP FIA /
-  // GDN conv task-update). vLLM synchronizes the current stream before every
-  // FULL graph replay (compilation/acl_graph.py) so iteration i cannot rewrite
-  // task handles / record external events while iteration i-1's graph is still
-  // running. Synchronizing the current stream here waits for both the previous
-  // graph replay (queued on this stream by the prior
+  // Per-replay completion barrier for the DCP FIA graph-task path. vLLM
+  // synchronizes the current stream before every FULL graph replay
+  // (compilation/acl_graph.py) so iteration i cannot rewrite FIA task handles /
+  // record external events while iteration i-1's graph is still running.
+  // Synchronizing the current stream here waits for both the previous graph
+  // replay (queued on this stream by the prior
   // make_current_stream_wait_for_graph) and this step's persistent-input copies
   // before we launch and re-inject task parameters, preventing cross-replay
   // task/event generation overlap (delayed ACL_ERROR_RT_MODEL_EXECUTE 507011).
-  // First-version host-blocking barrier; can later become a persistent
-  // input-ready/replay-done event chain (never a stack-local event).
+  // Scoped to graphs that captured FIA tasks (i.e. DCP decode) so the ordinary
+  // dcp=1 GDN conv graph keeps its non-blocking replay hot path, for which no
+  // such fault has been observed. First-version host-blocking barrier; can
+  // later become a persistent input-ready/replay-done event chain (never a
+  // stack-local event).
+  const bool has_fia_graph_tasks =
+      graph_task_context_ != nullptr && !graph_task_context_->fia_tasks.empty();
   if (!graph_paged_attention_tiling_data_.defined() &&
-      model->is_hybrid_linear_attention() && !use_static_graph_tasks) {
+      model->is_hybrid_linear_attention() && !use_static_graph_tasks &&
+      has_fia_graph_tasks) {
     CHECK_EQ(aclrtSynchronizeStream(stream), ACL_SUCCESS)
         << "pre-replay current-stream synchronize failed";
   }
