@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <memory>
@@ -31,6 +32,34 @@ limitations under the License.
 namespace xllm {
 namespace parallel_state {
 namespace {
+
+// Expected DCP owner/local-slot mapping, used to cross-check the production
+// tensor path (select_dcp_local_block_table / remap_dcp_cache_slots). Owner
+// formula mirrors production: floor(position / interleave) % dcp_size.
+int64_t expected_dcp_cache_slot(int64_t logical_slot,
+                                int64_t position,
+                                int32_t block_size,
+                                int32_t dcp_size,
+                                int32_t dcp_rank,
+                                int32_t interleave_size) {
+  if (logical_slot < 0) {
+    return -1;
+  }
+  CHECK_GE(position, 0) << "position must be non-negative.";
+  CHECK_GT(block_size, 0) << "block_size must be positive.";
+  CHECK_GT(dcp_size, 1) << "dcp_size must be greater than 1.";
+  CHECK_GE(dcp_rank, 0) << "dcp_rank must be non-negative.";
+  CHECK_LT(dcp_rank, dcp_size) << "dcp_rank must be smaller than dcp_size.";
+  CHECK_GT(interleave_size, 0) << "interleave_size must be positive.";
+  CHECK_EQ(interleave_size, block_size)
+      << "DCP local block-table selection requires block interleave.";
+
+  const int64_t owner = (position / block_size) % dcp_size;
+  if (owner != dcp_rank) {
+    return -1;
+  }
+  return logical_slot;
+}
 
 // Re-derive the CP rank of a global rank from the documented layout:
 //   rank = dp_rank * (cp_size * attn_tp_size) + cp_rank * attn_tp_size +
@@ -251,63 +280,6 @@ TEST(ComputeDcpGroupRanks, RejectsNonIntegralDcpGroups) {
                "");
 }
 
-TEST(ComputeDcpCacheSlot, PreservesOwnerPhysicalSlots) {
-  const int32_t block_size = 4;
-  const int32_t dcp_size = 2;
-  const int32_t interleave_size = block_size;
-
-  EXPECT_EQ(compute_dcp_cache_slot(/*logical_slot=*/151,
-                                   /*position=*/0,
-                                   block_size,
-                                   dcp_size,
-                                   /*dcp_rank=*/0,
-                                   interleave_size),
-            151);
-  EXPECT_EQ(compute_dcp_cache_slot(/*logical_slot=*/23,
-                                   /*position=*/4,
-                                   block_size,
-                                   dcp_size,
-                                   /*dcp_rank=*/0,
-                                   interleave_size),
-            -1);
-  EXPECT_EQ(compute_dcp_cache_slot(/*logical_slot=*/23,
-                                   /*position=*/4,
-                                   block_size,
-                                   dcp_size,
-                                   /*dcp_rank=*/1,
-                                   interleave_size),
-            23);
-  EXPECT_EQ(compute_dcp_cache_slot(/*logical_slot=*/359,
-                                   /*position=*/8,
-                                   block_size,
-                                   dcp_size,
-                                   /*dcp_rank=*/0,
-                                   interleave_size),
-            359);
-}
-
-TEST(ComputeDcpCacheSlot, RejectsSubBlockInterleave) {
-  const int32_t block_size = 4;
-  const int32_t dcp_size = 2;
-  EXPECT_DEATH(compute_dcp_cache_slot(/*logical_slot=*/0,
-                                      /*position=*/0,
-                                      block_size,
-                                      dcp_size,
-                                      /*dcp_rank=*/0,
-                                      /*interleave_size=*/1),
-               "");
-}
-
-TEST(ComputeDcpCacheSlot, PreservesNegativeSlots) {
-  EXPECT_EQ(compute_dcp_cache_slot(/*logical_slot=*/-1,
-                                   /*position=*/0,
-                                   /*block_size=*/4,
-                                   /*dcp_size=*/2,
-                                   /*dcp_rank=*/0,
-                                   /*interleave_size=*/4),
-            -1);
-}
-
 TEST(SelectDcpLocalBlockTable, SelectsOriginalNonContiguousBlockIds) {
   const torch::Tensor global_block_table =
       torch::tensor({{37, 5, 89, 2}, {41, 13, 73, 29}},
@@ -362,12 +334,12 @@ TEST(DcpCacheLayout, PrefillWritesMatchDecodeLocalBlockTable) {
           static_cast<int64_t>(global_block_index) * block_size +
           (block_size - 1);
       const int64_t owner_slot =
-          compute_dcp_cache_slot(original_slot,
-                                 position,
-                                 block_size,
-                                 dcp_size,
-                                 dcp_rank,
-                                 /*interleave_size=*/block_size);
+          expected_dcp_cache_slot(original_slot,
+                                  position,
+                                  block_size,
+                                  dcp_size,
+                                  dcp_rank,
+                                  /*interleave_size=*/block_size);
       const int64_t decode_block_id =
           local_block_table.index({0, local_block_index}).item<int64_t>();
 

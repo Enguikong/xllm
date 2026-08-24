@@ -304,31 +304,6 @@ std::vector<int32_t> compute_dcp_group_ranks(int32_t global_rank,
   return ranks;
 }
 
-int64_t compute_dcp_cache_slot(int64_t logical_slot,
-                               int64_t position,
-                               int32_t block_size,
-                               int32_t dcp_size,
-                               int32_t dcp_rank,
-                               int32_t interleave_size) {
-  if (logical_slot < 0) {
-    return -1;
-  }
-  CHECK_GE(position, 0) << "position must be non-negative.";
-  CHECK_GT(block_size, 0) << "block_size must be positive.";
-  CHECK_GT(dcp_size, 1) << "dcp_size must be greater than 1.";
-  CHECK_GE(dcp_rank, 0) << "dcp_rank must be non-negative.";
-  CHECK_LT(dcp_rank, dcp_size) << "dcp_rank must be smaller than dcp_size.";
-  CHECK_GT(interleave_size, 0) << "interleave_size must be positive.";
-  CHECK_EQ(interleave_size, block_size)
-      << "DCP local block-table selection requires block interleave.";
-
-  const int64_t owner = (position / block_size) % dcp_size;
-  if (owner != dcp_rank) {
-    return -1;
-  }
-  return logical_slot;
-}
-
 torch::Tensor select_dcp_local_block_table(const torch::Tensor& block_table,
                                            int32_t dcp_size,
                                            int32_t dcp_rank) {

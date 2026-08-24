@@ -5,8 +5,8 @@ cc_test(
     npu_dcp_attention_utils_test
   SRCS
     dcp_attention_utils_test.cpp
-    "${PROJECT_SOURCE_DIR}/xllm/core/layers/npu_torch/dcp_attention_utils.cpp"
   DEPS
+    :dcp_attention_utils
     glog::glog
     torch
     GTest::gtest_main
