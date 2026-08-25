@@ -93,6 +93,7 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
                                      int32_t ep_size,
                                      const InstanceRole& instance_role,
                                      bool enable_mtp_draft_body_tp1,
+                                     const std::string& draft_sampling_mode,
                                      int32_t decode_context_parallel_size) {
   // TODO: pass whole xllm::runtime::Options here from main process.
   xllm::runtime::Options runner_options;
@@ -114,6 +115,7 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
       .enable_mtp_draft_body_tp1(enable_mtp_draft_body_tp1)
       .num_speculative_tokens(num_speculative_tokens)
       .speculative_algorithm(speculative_algorithm)
+      .draft_sampling_mode(draft_sampling_mode)
       .enable_schedule_overlap(/*enable_schedule_overlap=*/false)
       .enable_offline_inference(/*enable_offline_inference=*/true)
       .master_node_addr(master_node_addr)

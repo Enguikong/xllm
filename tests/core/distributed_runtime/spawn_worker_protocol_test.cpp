@@ -89,6 +89,7 @@ TEST(SpawnWorkerProtocolTest, PreservesExplicitEmptyDtype) {
 }
 
 TEST(SpawnWorkerProtocolTest, AppendsDecodeContextParallelSizeAtTail) {
+  EXPECT_EQ(kDraftSamplingModeArgumentIndex, kArgumentCount - 2);
   EXPECT_EQ(kDecodeContextParallelSizeArgumentIndex, kArgumentCount - 1);
 }
 

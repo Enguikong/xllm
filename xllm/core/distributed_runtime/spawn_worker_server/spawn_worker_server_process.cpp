@@ -61,6 +61,7 @@ limitations under the License.
 // @indexer_cache_dtype
 // @enable_mtp_draft_body_tp1
 // @text_encoder_tp_size
+// @draft_sampling_mode
 // @decode_context_parallel_size
 int main(int argc, char* argv[]) {
   const std::optional<std::string> parsed_indexer_cache_dtype =
@@ -114,6 +115,8 @@ int main(int argc, char* argv[]) {
   int32_t ep_size = static_cast<int32_t>(atoi(argv[32]));
   std::string instance_role_str = std::string(argv[33]);
   const std::string& indexer_cache_dtype = parsed_indexer_cache_dtype.value();
+  const std::string draft_sampling_mode =
+      xllm::spawn_worker_protocol::parse_draft_sampling_mode(argc, argv);
   const bool enable_mtp_draft_body_tp1 =
       argc > xllm::spawn_worker_protocol::kEnableMtpDraftBodyTp1ArgumentIndex &&
       static_cast<int32_t>(
@@ -181,6 +184,7 @@ int main(int argc, char* argv[]) {
       << ", text_encoder_tp_size = " << text_encoder_tp_size
       << ", indexer_cache_dtype = " << indexer_cache_dtype
       << ", enable_mtp_draft_body_tp1 = " << enable_mtp_draft_body_tp1
+      << ", draft_sampling_mode = " << draft_sampling_mode
       << ", decode_context_parallel_size = " << decode_context_parallel_size
       << "\n";
 
@@ -220,6 +224,7 @@ int main(int argc, char* argv[]) {
                                  ep_size,
                                  instance_role,
                                  enable_mtp_draft_body_tp1,
+                                 draft_sampling_mode,
                                  decode_context_parallel_size);
 
   worker.run();
